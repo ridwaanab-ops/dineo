@@ -2,19 +2,21 @@
 #                             account_inquiry with personal code + WA fallback)
 
 import asyncio, os, re, json, time, logging, random, tempfile, threading, secrets, io, csv, mimetypes, hashlib, math
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Callable, Dict, List, Optional, Pattern, Tuple
 from pathlib import Path
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone, time as dt_time
 from urllib.parse import urlencode
 
 import requests
 import bcrypt
-from fastapi import FastAPI, Request, HTTPException, Form, UploadFile, File
+from fastapi import FastAPI, Request, HTTPException, Form, UploadFile, File, BackgroundTasks, Query
 from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
 import io
+from collections import Counter
 from fpdf import FPDF
 
 # -----------------------------------------------------------------------------
@@ -39,6 +41,9 @@ OPENAI_MODEL   = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
 OPENAI_TRANSCRIBE_MODEL = os.environ.get("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
 
 LOG_DB_INSERTS = os.getenv("LOG_DB_INSERTS", "0") == "1"  # also enables a few debug traces
+INBOUND_DEDUPE_TTL_SECONDS = int(os.getenv("INBOUND_DEDUPE_TTL_SECONDS", str(24 * 60 * 60)))
+INBOUND_DEDUPE_MAX_IDS = int(os.getenv("INBOUND_DEDUPE_MAX_IDS", "50"))
+REPEAT_REPLY_WINDOW_SECONDS = int(os.getenv("REPEAT_REPLY_WINDOW_SECONDS", "300"))
 # Approved WhatsApp templates (expand as needed)
 APPROVED_WA_TEMPLATES = [
     {
@@ -113,6 +118,7 @@ APPROVED_WA_TEMPLATES = [
         "variants": ["collections_followup_24h", "collections_followup_24h_v2"],
     },
 ]
+SKIP_TEMPLATE_CONTEXT_PREFIXES = ("payment_reminder", "performance_")
 ISSABEL_CLICK2CALL_URL = os.getenv("ISSABEL_CLICK2CALL_URL")  # e.g. https://pbx.example.com/click2call
 ISSABEL_USERNAME = os.getenv("ISSABEL_USERNAME")
 ISSABEL_PASSWORD = os.getenv("ISSABEL_PASSWORD")
@@ -122,6 +128,27 @@ SAFE_LOG_COLUMNS = {
     "message_id", "wa_message_id", "wa_id", "phone",
     "message_direction", "status", "intent", "timestamp", "created_at"
 }
+
+# Telematics (Cartrack / PowerFleet) last-known location fetch
+TELEMATICS_CACHE_SECONDS = int(os.getenv("TELEMATICS_CACHE_SECONDS", "900"))
+TELEMATICS_HTTP_TIMEOUT_SECONDS = float(os.getenv("TELEMATICS_HTTP_TIMEOUT_SECONDS", "6"))
+TELEMATICS_PROVIDER_PRIORITY = os.getenv("TELEMATICS_PROVIDER_PRIORITY", "cartrack,powerfleet")
+
+CARTRACK_LAST_LOCATION_URL = os.getenv("CARTRACK_LAST_LOCATION_URL", "").strip()
+CARTRACK_HEADERS_JSON = os.getenv("CARTRACK_HEADERS_JSON", "").strip()
+CARTRACK_API_TOKEN = os.getenv("CARTRACK_API_TOKEN", "").strip()
+CARTRACK_API_KEY = os.getenv("CARTRACK_API_KEY", "").strip()
+CARTRACK_USERNAME = os.getenv("CARTRACK_USERNAME", "").strip()
+CARTRACK_PASSWORD = os.getenv("CARTRACK_PASSWORD", "").strip()
+CARTRACK_VERIFY_TLS = os.getenv("CARTRACK_VERIFY_TLS", "1") != "0"
+
+POWERFLEET_LAST_LOCATION_URL = os.getenv("POWERFLEET_LAST_LOCATION_URL", "").strip()
+POWERFLEET_HEADERS_JSON = os.getenv("POWERFLEET_HEADERS_JSON", "").strip()
+POWERFLEET_API_TOKEN = os.getenv("POWERFLEET_API_TOKEN", "").strip()
+POWERFLEET_API_KEY = os.getenv("POWERFLEET_API_KEY", "").strip()
+POWERFLEET_USERNAME = os.getenv("POWERFLEET_USERNAME", "").strip()
+POWERFLEET_PASSWORD = os.getenv("POWERFLEET_PASSWORD", "").strip()
+POWERFLEET_VERIFY_TLS = os.getenv("POWERFLEET_VERIFY_TLS", "1") != "0"
 
 ZERO_TRIP_NUDGES_ENABLED = os.getenv("ZERO_TRIP_NUDGES_ENABLED", "1") == "1"
 ZERO_TRIP_NUDGE_INTERVAL_SECONDS = int(os.getenv("ZERO_TRIP_NUDGE_INTERVAL_SECONDS", str(3 * 60 * 60)))
@@ -149,12 +176,23 @@ INTRADAY_DAILY_MIN_FINISHED_ORDERS = int(os.getenv("INTRADAY_DAILY_MIN_FINISHED_
 INTRADAY_UPDATE_INTENT = "intraday_update"
 INTRADAY_AUTO_ON_RESPONDED = os.getenv("INTRADAY_AUTO_ON_RESPONDED", "1") == "1"
 INTRADAY_CHECKPOINT_RATIOS = [
-    (10, 8 / 22),
-    (12, 12 / 22),
-    (14, 16 / 22),
-    (16, 20 / 22),
+    (12, 0.5),
     (18, 1.0),
 ]
+
+def _parse_public_holiday_dates(raw: str) -> set[date]:
+    entries = [entry.strip() for entry in (raw or "").split(",")]
+    parsed: set[date] = set()
+    for candidate in entries:
+        if not candidate:
+            continue
+        try:
+            parsed.add(datetime.strptime(candidate, "%Y-%m-%d").date())
+        except Exception:
+            log.debug("Ignoring invalid public holiday date %r", candidate)
+    return parsed
+
+PAYMENT_PUBLIC_HOLIDAYS = _parse_public_holiday_dates(os.getenv("PAYMENT_PUBLIC_HOLIDAYS", ""))
 
 BASE_DIR = Path(__file__).resolve().parent
 _templates_override = os.getenv("TEMPLATES_DIR")
@@ -195,6 +233,26 @@ def _jinja_meta_value(value, key=""):
 
 templates.env.filters["meta_value"] = _jinja_meta_value
 
+WHATSAPP_TEMPLATE_REGISTRY_PATH = Path(
+    os.getenv("WHATSAPP_TEMPLATE_REGISTRY_PATH", str(BASE_DIR / "whatsapp_templates.json"))
+)
+WHATSAPP_TEMPLATE_STATUSES = ("approved", "pending", "declined")
+WHATSAPP_TEMPLATE_META_FIELDS = [
+    ("category", "Category / journey"),
+    ("audience", "Audience"),
+    ("purpose", "Purpose"),
+    ("priority", "Priority"),
+    ("reference_url", "Reference URL"),
+]
+WHATSAPP_TEMPLATE_META_KEYS = tuple(field[0] for field in WHATSAPP_TEMPLATE_META_FIELDS)
+
+STATIC_DIR = Path(os.getenv("STATIC_DIR", str(BASE_DIR / "static")))
+STATIC_URL_PREFIX = os.getenv("STATIC_URL_PREFIX", "/static").rstrip("/")
+if not STATIC_URL_PREFIX:
+    STATIC_URL_PREFIX = "/static"
+
+LICENSE_DISK_EXAMPLE_URL = f"{STATIC_URL_PREFIX}/image/company_example.png"
+
 # -----------------------------------------------------------------------------
 # Timezone helpers (Africa/Johannesburg)
 # -----------------------------------------------------------------------------
@@ -203,9 +261,11 @@ try:
 except Exception:
     ZoneInfo = None
 
+JHB_ZONE = ZoneInfo("Africa/Johannesburg") if ZoneInfo else timezone(timedelta(hours=2))
+
 def jhb_now() -> datetime:
     try:
-        return datetime.now(ZoneInfo("Africa/Johannesburg")) if ZoneInfo else datetime.utcnow() + timedelta(hours=2)
+        return datetime.now(JHB_ZONE)
     except Exception:
         return datetime.utcnow() + timedelta(hours=2)
 
@@ -264,6 +324,715 @@ def _format_metadata_value(key: str, value: Any) -> str:
         return str(value)
     return str(value)
 
+
+def _parse_date_param(value: Optional[str]) -> Optional[date]:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value.strip(), "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def _parse_multi_param(values: Optional[List[str]]) -> List[str]:
+    if not values:
+        return []
+    cleaned: List[str] = []
+    for value in values:
+        if value is None:
+            continue
+        for part in str(value).split(","):
+            entry = part.strip()
+            if entry:
+                cleaned.append(entry)
+    seen: set[str] = set()
+    deduped: List[str] = []
+    for entry in cleaned:
+        key = entry.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(entry)
+    return deduped
+
+
+def _parse_headers_json(raw: str) -> Dict[str, str]:
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    headers: Dict[str, str] = {}
+    for key, value in payload.items():
+        if key and value is not None:
+            headers[str(key)] = str(value)
+    return headers
+
+
+def _build_telematics_headers(
+    *,
+    headers_raw: str,
+    api_token: str,
+    api_key: str,
+) -> Dict[str, str]:
+    headers = _parse_headers_json(headers_raw)
+    if api_token and "authorization" not in {k.lower(): v for k, v in headers.items()}:
+        headers["Authorization"] = f"Bearer {api_token}"
+    if api_key and "x-api-key" not in {k.lower(): v for k, v in headers.items()}:
+        headers["x-api-key"] = api_key
+    return headers
+
+
+def _normalize_vehicle_reg(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    cleaned = re.sub(r"\s+", "", str(value)).upper()
+    return cleaned or None
+
+
+def _extract_telematics_location(raw: Any, source: str) -> Optional[Dict[str, Any]]:
+    if raw is None:
+        return None
+    payload = raw
+    if isinstance(payload, list):
+        payload = payload[0] if payload else None
+    if isinstance(payload, dict):
+        for key in ("position", "last_position", "lastLocation", "last_location", "location"):
+            if isinstance(payload.get(key), dict):
+                payload = payload.get(key)
+                break
+    if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+        payload = payload.get("data")[0] if payload.get("data") else payload
+    if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+        payload = payload.get("data")
+    if not isinstance(payload, dict):
+        return None
+
+    lat = payload.get("latitude")
+    if lat is None:
+        lat = payload.get("lat")
+    lng = payload.get("longitude")
+    if lng is None:
+        lng = payload.get("lng")
+    if lng is None:
+        lng = payload.get("lon")
+
+    lat = _coerce_float(lat)
+    lng = _coerce_float(lng)
+    if lat is None and lng is None:
+        return None
+
+    address = payload.get("address") or payload.get("formatted_address") or payload.get("location")
+    name = payload.get("name") or payload.get("place") or payload.get("label")
+    timestamp = payload.get("timestamp") or payload.get("time") or payload.get("device_time") or payload.get("date_time")
+
+    return {
+        "latitude": lat,
+        "longitude": lng,
+        "address": address,
+        "name": name,
+        "timestamp": timestamp,
+        "source": source,
+    }
+
+
+def _fetch_cartrack_last_location(vehicle_reg: str) -> Optional[Dict[str, Any]]:
+    if not CARTRACK_LAST_LOCATION_URL:
+        return None
+    url = CARTRACK_LAST_LOCATION_URL
+    params: Dict[str, Any] = {}
+    if "{reg}" in url:
+        url = url.format(reg=vehicle_reg)
+    else:
+        params["reg"] = vehicle_reg
+    headers = _build_telematics_headers(
+        headers_raw=CARTRACK_HEADERS_JSON,
+        api_token=CARTRACK_API_TOKEN,
+        api_key=CARTRACK_API_KEY,
+    )
+    auth = (CARTRACK_USERNAME, CARTRACK_PASSWORD) if CARTRACK_USERNAME and CARTRACK_PASSWORD else None
+    try:
+        resp = requests.get(
+            url,
+            params=params,
+            headers=headers,
+            auth=auth,
+            timeout=TELEMATICS_HTTP_TIMEOUT_SECONDS,
+            verify=CARTRACK_VERIFY_TLS,
+        )
+        if resp.status_code >= 400:
+            log.debug("Cartrack last location error status=%s body=%s", resp.status_code, resp.text[:200])
+            return None
+        payload = resp.json()
+    except Exception as exc:
+        log.debug("Cartrack last location fetch failed: %s", exc)
+        return None
+    return _extract_telematics_location(payload, "cartrack")
+
+
+def _fetch_powerfleet_last_location(vehicle_reg: str) -> Optional[Dict[str, Any]]:
+    if not POWERFLEET_LAST_LOCATION_URL:
+        return None
+    url = POWERFLEET_LAST_LOCATION_URL
+    params: Dict[str, Any] = {}
+    if "{reg}" in url:
+        url = url.format(reg=vehicle_reg)
+    else:
+        params["reg"] = vehicle_reg
+    headers = _build_telematics_headers(
+        headers_raw=POWERFLEET_HEADERS_JSON,
+        api_token=POWERFLEET_API_TOKEN,
+        api_key=POWERFLEET_API_KEY,
+    )
+    auth = (POWERFLEET_USERNAME, POWERFLEET_PASSWORD) if POWERFLEET_USERNAME and POWERFLEET_PASSWORD else None
+    try:
+        resp = requests.get(
+            url,
+            params=params,
+            headers=headers,
+            auth=auth,
+            timeout=TELEMATICS_HTTP_TIMEOUT_SECONDS,
+            verify=POWERFLEET_VERIFY_TLS,
+        )
+        if resp.status_code >= 400:
+            log.debug("PowerFleet last location error status=%s body=%s", resp.status_code, resp.text[:200])
+            return None
+        payload = resp.json()
+    except Exception as exc:
+        log.debug("PowerFleet last location fetch failed: %s", exc)
+        return None
+    return _extract_telematics_location(payload, "powerfleet")
+
+
+def _get_telematics_last_location(ctx: Dict[str, Any], vehicle_reg: str) -> Optional[Dict[str, Any]]:
+    cached = ctx.get("_telematics_last_location")
+    if isinstance(cached, dict):
+        cached_reg = _normalize_vehicle_reg(cached.get("vehicle_reg"))
+        cached_at = cached.get("captured_at")
+        try:
+            if (
+                cached_reg
+                and cached_reg == _normalize_vehicle_reg(vehicle_reg)
+                and cached_at
+                and (time.time() - float(cached_at)) <= TELEMATICS_CACHE_SECONDS
+            ):
+                return cached.get("location")
+        except Exception:
+            pass
+
+    providers = [p.strip().lower() for p in (TELEMATICS_PROVIDER_PRIORITY or "").split(",") if p.strip()]
+    for provider in providers:
+        if provider == "cartrack":
+            location = _fetch_cartrack_last_location(vehicle_reg)
+        elif provider == "powerfleet":
+            location = _fetch_powerfleet_last_location(vehicle_reg)
+        else:
+            continue
+        if location:
+            ctx["_telematics_last_location"] = {
+                "vehicle_reg": vehicle_reg,
+                "captured_at": time.time(),
+                "location": location,
+            }
+            return location
+    return None
+
+
+def _resolve_vehicle_reg_for_telematics(
+    wa_id: str,
+    driver: Optional[Dict[str, Any]],
+    ticket: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    candidates: List[str] = []
+    driver = driver or {}
+    ticket = ticket or {}
+    meta = ticket.get("metadata_dict") or {}
+    for value in [
+        driver.get("car_reg_number"),
+        driver.get("car_reg"),
+        driver.get("registration_number"),
+        driver.get("reg_number"),
+        driver.get("vehicle_reg"),
+        meta.get("vehicle_reg"),
+        meta.get("car_reg_number"),
+    ]:
+        if value:
+            candidates.append(str(value))
+    for value in candidates:
+        cleaned = _normalize_vehicle_reg(value)
+        if cleaned:
+            return cleaned
+    fallback = _fetch_driver_registration_by_wa([wa_id]) if wa_id else {}
+    if wa_id and fallback.get(wa_id):
+        return _normalize_vehicle_reg(fallback.get(wa_id))
+    return None
+
+
+def _ticket_has_location(ticket: Dict[str, Any]) -> bool:
+    if not ticket:
+        return False
+    if ticket.get("location_desc"):
+        return True
+    if ticket.get("location_lat") is not None or ticket.get("location_lng") is not None:
+        return True
+    meta = ticket.get("metadata_dict") or {}
+    raw = meta.get("location_raw") if isinstance(meta, dict) else None
+    if isinstance(raw, dict):
+        if raw.get("latitude") is not None or raw.get("longitude") is not None:
+            return True
+        if raw.get("address") or raw.get("name"):
+            return True
+    return False
+
+
+def _format_telematics_timestamp(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        formatted = _format_timestamp_value(value)
+        if formatted:
+            return formatted
+    except Exception:
+        pass
+    return str(value)
+
+
+def _maybe_capture_telematics_location_for_ticket(
+    *,
+    wa_id: str,
+    driver: Optional[Dict[str, Any]],
+    ctx: Dict[str, Any],
+    ticket_id: Optional[int],
+) -> Optional[Dict[str, Any]]:
+    if not (wa_id and ticket_id and ctx is not None):
+        return None
+    if not (CARTRACK_LAST_LOCATION_URL or POWERFLEET_LAST_LOCATION_URL):
+        return None
+    ticket = fetch_driver_issue_ticket(ticket_id)
+    if not ticket or _ticket_has_location(ticket):
+        return None
+    vehicle_reg = _resolve_vehicle_reg_for_telematics(wa_id, driver, ticket)
+    if not vehicle_reg:
+        return None
+    location = _get_telematics_last_location(ctx, vehicle_reg)
+    if not location:
+        return None
+    desc = location.get("address") or location.get("name")
+    lat = location.get("latitude")
+    lng = location.get("longitude")
+    if not desc and lat is not None and lng is not None:
+        desc = f"{lat:.5f}, {lng:.5f}"
+    if ticket_id:
+        update_driver_issue_location(
+            ticket_id,
+            latitude=lat,
+            longitude=lng,
+            description=desc,
+            raw={
+                "latitude": lat,
+                "longitude": lng,
+                "address": location.get("address"),
+                "name": location.get("name"),
+                "timestamp": location.get("timestamp"),
+                "source": location.get("source"),
+            },
+            mark_received=False,
+        )
+        metadata_patch = {
+            "location_source": location.get("source"),
+            "location_captured_at": jhb_now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        ts_label = _format_telematics_timestamp(location.get("timestamp"))
+        if ts_label:
+            metadata_patch["location_timestamp"] = ts_label
+        update_driver_issue_metadata(ticket_id, metadata_patch)
+    return location
+
+
+def _maybe_capture_telematics_location_for_open_ticket(
+    *,
+    wa_id: str,
+    driver: Optional[Dict[str, Any]],
+    ctx: Dict[str, Any],
+    location_payload: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    if location_payload and (
+        location_payload.get("latitude") is not None or location_payload.get("longitude") is not None
+    ):
+        return None
+    open_ticket = fetch_open_driver_issue_ticket(wa_id)
+    if not open_ticket:
+        return None
+    issue_type = (open_ticket.get("issue_type") or "").strip().lower()
+    if issue_type and issue_type not in LOCATION_RELEVANT_ISSUE_TYPES:
+        return None
+    return _maybe_capture_telematics_location_for_ticket(
+        wa_id=wa_id,
+        driver=driver,
+        ctx=ctx,
+        ticket_id=open_ticket.get("id"),
+    )
+
+
+# ----------------------------------------------------------------
+# Ticket SLA helpers
+# ----------------------------------------------------------------
+def _normalize_status_value(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+SLA_CONFIG_PATH = Path(os.getenv("SLA_CONFIG_PATH", str(BASE_DIR / "sla_config.json")))
+
+DEFAULT_TICKET_SLA_HOURS_BY_STATUS: Dict[str, float] = {
+    "renewal_due": 240,
+    "collecting": 240,
+    "to_collect": 24,
+    "collected": 24,
+    "pending_ops": 24,
+    "pending_driver": 48,
+    "roadworthy_completed": 24,
+    "renewal_completed": 24,
+    "uploaded_on_cancom": 24,
+}
+
+def _sanitize_sla_hours(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        hours = float(value)
+    else:
+        raw = str(value).strip()
+        if not raw:
+            return None
+        try:
+            hours = float(raw)
+        except Exception:
+            return None
+    if not math.isfinite(hours):
+        return None
+    if hours < 0:
+        hours = 0.0
+    if hours.is_integer():
+        return int(hours)
+    return hours
+
+def _load_ticket_sla_config() -> Dict[str, float]:
+    if not SLA_CONFIG_PATH.exists():
+        return DEFAULT_TICKET_SLA_HOURS_BY_STATUS.copy()
+    try:
+        raw = json.loads(SLA_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.warning("Failed to read SLA config from %s: %s", SLA_CONFIG_PATH, exc)
+        return DEFAULT_TICKET_SLA_HOURS_BY_STATUS.copy()
+    if isinstance(raw, dict) and isinstance(raw.get("statuses"), dict):
+        raw = raw.get("statuses", {})
+    if not isinstance(raw, dict):
+        return DEFAULT_TICKET_SLA_HOURS_BY_STATUS.copy()
+    mapping: Dict[str, float] = {}
+    for key, value in raw.items():
+        status = _normalize_status_value(key)
+        if not status:
+            continue
+        hours = _sanitize_sla_hours(value)
+        if hours is None:
+            continue
+        mapping[status] = hours
+    return mapping or DEFAULT_TICKET_SLA_HOURS_BY_STATUS.copy()
+
+def _persist_ticket_sla_config(mapping: Dict[str, float]) -> bool:
+    cleaned: Dict[str, float] = {}
+    for key, value in mapping.items():
+        status = _normalize_status_value(key)
+        if not status:
+            continue
+        hours = _sanitize_sla_hours(value)
+        if hours is None:
+            continue
+        cleaned[status] = hours
+    try:
+        SLA_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ordered = dict(sorted(cleaned.items(), key=lambda item: item[0]))
+        SLA_CONFIG_PATH.write_text(_json_dumps(ordered, pretty=True), encoding="utf-8")
+        return True
+    except Exception as exc:
+        log.warning("Failed to save SLA config to %s: %s", SLA_CONFIG_PATH, exc)
+        return False
+
+TICKET_SLA_HOURS_BY_STATUS = _load_ticket_sla_config()
+
+CLOSED_STATUSES = {"closed", "resolved", "done"}
+
+SLA_BREAKDOWN_LABELS = [
+    ("within", "Within SLA"),
+    ("overdue", "Overdue"),
+]
+
+RESOLVED_TICKET_STATUSES = {"closed", "driver_confirmed_resolved", "collected", "install_completed"}
+TERMINAL_TIMELINE_STATUSES = {"install_completed"}
+OPEN_TIME_EXCLUDED_STATUSES = {"closed", "driver_confirmed_resolved"}
+
+
+def _format_elapsed(duration: Optional[timedelta]) -> str:
+    if not duration:
+        return "—"
+    secs = int(duration.total_seconds())
+    if secs <= 0:
+        return "0m"
+    days, secs = divmod(secs, 86400)
+    hours, secs = divmod(secs, 3600)
+    minutes = secs // 60
+    parts: List[str] = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes or not parts:
+        parts.append(f"{minutes}m")
+    return " ".join(parts)
+
+
+def _status_label(value: Optional[str]) -> str:
+    clean = str(value or "unknown").strip()
+    return clean.replace("_", " ").title() if clean else "Unknown"
+
+
+def _status_color(value: Optional[str]) -> str:
+    status = _normalize_status_value(value)
+    if not status:
+        return "#94a3b8"
+    if status in CLOSED_STATUSES or status in RESOLVED_TICKET_STATUSES:
+        return "#34d399"
+    if any(token in status for token in ("pending", "renewal", "due", "to_collect")):
+        return "#fbbf24"
+    if any(token in status for token in ("collect", "roadworthy", "upload", "ready")):
+        return "#60a5fa"
+    if any(token in status for token in ("fail", "cancel", "reject")):
+        return "#f87171"
+    return "#38bdf8"
+
+
+def _format_ticket_timestamp(value: Any) -> str:
+    formatted = _format_timestamp_value(value)
+    if formatted:
+        return formatted
+    return str(value or "")
+
+
+def _build_ticket_status_timeline(
+    ticket: Optional[Dict[str, Any]],
+    logs: Optional[List[Dict[str, Any]]],
+) -> Dict[str, Any]:
+    timeline = {
+        "segments": [],
+        "total_seconds": 0.0,
+        "total_human": "—",
+        "started_at": None,
+        "updated_at": None,
+        "current_status": None,
+    }
+    if not ticket:
+        return timeline
+
+    def _strip_tz(value: Optional[datetime]) -> Optional[datetime]:
+        if isinstance(value, datetime) and value.tzinfo:
+            return value.replace(tzinfo=None)
+        return value
+
+    created_at = _strip_tz(_parse_log_timestamp(ticket.get("created_at")))
+    updated_at = _strip_tz(_parse_log_timestamp(ticket.get("last_update_at")))
+    now = _strip_tz(jhb_now())
+
+    events: List[Dict[str, Any]] = []
+    for log in logs or []:
+        ts = _strip_tz(_parse_log_timestamp(log.get("created_at")))
+        if not ts:
+            continue
+        from_status = _normalize_status_value(log.get("from_status"))
+        to_status = _normalize_status_value(log.get("to_status"))
+        if not (from_status or to_status):
+            continue
+        events.append({"ts": ts, "from": from_status, "to": to_status})
+
+    events.sort(key=lambda item: item["ts"])
+    if created_at is None and events:
+        created_at = events[0]["ts"]
+    if created_at is None:
+        return timeline
+
+    start_status = None
+    if events:
+        start_status = events[0]["from"] or _normalize_status_value(ticket.get("status"))
+    else:
+        start_status = _normalize_status_value(ticket.get("status"))
+    if not start_status:
+        start_status = "open"
+
+    segments: List[Dict[str, Any]] = []
+    start_ts = created_at
+    terminal_ts: Optional[datetime] = None
+    terminal_status: Optional[str] = None
+    for event in events:
+        end_ts = event["ts"]
+        if start_ts and end_ts and end_ts >= start_ts:
+            duration_seconds = (end_ts - start_ts).total_seconds()
+            segments.append(
+                {
+                    "status": start_status,
+                    "start_at": start_ts,
+                    "end_at": end_ts,
+                    "duration_seconds": duration_seconds,
+                }
+            )
+        if event.get("to"):
+            start_status = event["to"]
+        start_ts = end_ts
+        if start_status in TERMINAL_TIMELINE_STATUSES:
+            terminal_ts = start_ts
+            terminal_status = start_status
+            break
+
+    current_status = _normalize_status_value(ticket.get("status")) or start_status
+    end_ts = None
+    if terminal_ts is None and current_status in TERMINAL_TIMELINE_STATUSES:
+        terminal_ts = updated_at or start_ts
+        terminal_status = current_status
+    if terminal_ts is not None:
+        end_ts = terminal_ts
+    elif current_status in CLOSED_STATUSES and updated_at:
+        end_ts = updated_at
+    else:
+        end_ts = now
+
+    if terminal_ts is not None:
+        if terminal_status:
+            segments.append(
+                {
+                    "status": terminal_status,
+                    "start_at": terminal_ts,
+                    "end_at": terminal_ts,
+                    "duration_seconds": 0.0,
+                }
+            )
+        current_status = terminal_status or current_status
+    elif start_ts and end_ts and end_ts >= start_ts:
+        segments.append(
+            {
+                "status": current_status,
+                "start_at": start_ts,
+                "end_at": end_ts,
+                "duration_seconds": (end_ts - start_ts).total_seconds(),
+            }
+        )
+
+    total_seconds = sum(
+        seg.get("duration_seconds") or 0
+        for seg in segments
+        if _normalize_status_value(seg.get("status"))
+        not in TERMINAL_TIMELINE_STATUSES.union(OPEN_TIME_EXCLUDED_STATUSES)
+    )
+    timeline["total_seconds"] = total_seconds
+    if total_seconds > 0:
+        timeline["total_human"] = _format_elapsed(timedelta(seconds=total_seconds))
+    timeline["started_at"] = _format_ticket_timestamp(created_at)
+    timeline["updated_at"] = _format_ticket_timestamp(updated_at or end_ts)
+    timeline["current_status"] = current_status or None
+
+    min_weight = max(total_seconds * 0.04, 60.0) if total_seconds else 1.0
+    for seg in segments:
+        duration_seconds = seg.get("duration_seconds") or 0.0
+        exclude_from_totals = (
+            _normalize_status_value(seg.get("status"))
+            in TERMINAL_TIMELINE_STATUSES.union(OPEN_TIME_EXCLUDED_STATUSES)
+        )
+        seg["label"] = _status_label(seg.get("status"))
+        seg["color"] = _status_color(seg.get("status"))
+        seg["active"] = bool(current_status and seg.get("status") == current_status)
+        seg["start_label"] = _format_ticket_timestamp(seg.get("start_at"))
+        seg["end_label"] = _format_ticket_timestamp(seg.get("end_at"))
+        seg["duration_human"] = _format_elapsed(timedelta(seconds=duration_seconds))
+        if exclude_from_totals:
+            seg["percent"] = 0.0
+        elif total_seconds > 0:
+            seg["percent"] = round((duration_seconds / total_seconds) * 100, 1)
+        else:
+            seg["percent"] = 100.0
+        seg["show_timeline"] = not exclude_from_totals
+        seg["weight"] = max(duration_seconds, min_weight) if total_seconds else 1.0
+
+    timeline["segments"] = segments
+    return timeline
+
+
+def _default_ticket_reply_email(
+    ticket: Optional[Dict[str, Any]],
+    email_logs: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[str]:
+    if not ticket:
+        return None
+    metadata = ticket.get("metadata_dict") or {}
+    for key in ("email_recipient", "driver_email", "email"):
+        value = metadata.get(key)
+        if value:
+            return str(value).strip()
+    wa_id = ticket.get("wa_id")
+    if wa_id:
+        profile, _ = fetch_driver_profile(wa_id)
+        if profile and profile.get("email"):
+            return str(profile.get("email")).strip()
+    if email_logs:
+        for entry in email_logs:
+            if (entry.get("direction") or "").upper() == "INBOUND" and entry.get("email_address"):
+                return str(entry.get("email_address")).strip()
+        for entry in email_logs:
+            if entry.get("email_address"):
+                return str(entry.get("email_address")).strip()
+    return None
+
+
+def _default_ticket_reply_subject(ticket: Optional[Dict[str, Any]]) -> str:
+    if not ticket:
+        return "Ticket update"
+    ticket_id = ticket.get("id")
+    issue_type = _issue_type_label(ticket.get("issue_type"))
+    if ticket_id:
+        return f"Ticket #{ticket_id} update · {issue_type}".strip()
+    return f"Ticket update · {issue_type}".strip()
+
+def _coerce_dt(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    dt: Optional[datetime] = None
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str):
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                dt = datetime.strptime(value, fmt)
+                break
+            except ValueError:
+                continue
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=JHB_ZONE)
+    return dt.astimezone(JHB_ZONE)
+
+def _ticket_sla_state(ticket: Dict[str, Any]) -> Tuple[str, str]:
+    status = (ticket.get("status") or "open").strip().lower()
+    if status in CLOSED_STATUSES:
+        return "—", "na"
+    sla_hours = TICKET_SLA_HOURS_BY_STATUS.get(status)
+    if not sla_hours:
+        return "—", "na"
+    start_dt = _coerce_dt(ticket.get("last_update_at")) or _coerce_dt(ticket.get("created_at"))
+    if not start_dt:
+        return "—", "na"
+    elapsed = jhb_now() - start_dt
+    overdue = elapsed > timedelta(hours=sla_hours)
+    return ("Overdue", "overdue") if overdue else ("Within", "within")
+
 # -----------------------------------------------------------------------------
 # MySQL config & utils
 # -----------------------------------------------------------------------------
@@ -295,7 +1064,19 @@ SMTP_PORT = int(_env("SMTP_PORT", "587"))
 SMTP_USERNAME = _env("SMTP_USERNAME") or _env("SMTP_USER")
 SMTP_PASSWORD = _env("SMTP_PASSWORD")
 SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "1") == "1"
+EMAIL_DEFAULT_RECIPIENT = _env("EMAIL_DEFAULT_RECIPIENT") or "fleet@mynextcar.io"
 RESET_TOKEN_MAX_AGE = int(os.getenv("ADMIN_RESET_TOKEN_MAX_AGE", str(60 * 60)))
+
+GMAIL_SERVICE_ACCOUNT_FILE = _env("GMAIL_SERVICE_ACCOUNT_FILE")
+GMAIL_DELEGATED_USER = _env("GMAIL_DELEGATED_USER") or SMTP_USERNAME
+GMAIL_OAUTH_CLIENT_FILE = _env("GMAIL_OAUTH_CLIENT_FILE")
+GMAIL_OAUTH_TOKEN_FILE = _env("GMAIL_OAUTH_TOKEN_FILE")
+GMAIL_QUERY = _env("GMAIL_QUERY", "in:inbox")
+GMAIL_INCLUDE_SPAM_TRASH = os.getenv("GMAIL_INCLUDE_SPAM_TRASH", "0") == "1"
+GMAIL_SYNC_MAX_RESULTS = int(os.getenv("GMAIL_SYNC_MAX_RESULTS", "50"))
+GMAIL_AUTO_SYNC_ENABLED = os.getenv("GMAIL_AUTO_SYNC_ENABLED", "1") == "1"
+GMAIL_AUTO_SYNC_INTERVAL_SECONDS = int(os.getenv("GMAIL_AUTO_SYNC_INTERVAL_SECONDS", str(15 * 60)))
+EMAIL_INLINE_IMAGE_MAP_RAW = os.getenv("EMAIL_INLINE_IMAGE_MAP", "")
 
 _admin_serializer = URLSafeTimedSerializer(ADMIN_SESSION_SECRET, salt="dineo-admin")
 _reset_serializer = URLSafeTimedSerializer(ADMIN_SESSION_SECRET, salt="dineo-admin-reset")
@@ -319,11 +1100,51 @@ DEFAULT_LOGO_DATA_URL = (
     "%3Cpath fill='%23282828' d='M412.5 128c-35.2 0-62.3-26.4-62.3-56 0-29.8 27-56.2 62.3-56.2 35 0 62.1 26.9 62.1 56.6 0 4-0.5 7.8-1.2 11.2h-82.4c4.2 8.9 13.7 15.5 26.8 15.5 9.3 0 19-3.6 24-9.8l28.3 17c-12 13-31 21.7-51.9 21.7Zm-24.2-66.4h47.6c-3.2-10-14-17.2-24-17.2-10.9 0-20.4 6.8-23.6 17.2Z'/%3E"
     "%3Crect x='242' y='134' width='88' height='18' fill='%2352c41a' rx='4'/%3E%3C/svg%3E"
 )
+LICENSE_DISK_GUIDE_IMAGE_PATH = os.getenv("LICENSE_DISK_GUIDE_IMAGE_PATH", "").strip()
+LICENSE_DISK_GUIDE_IMAGE_URL = os.getenv("LICENSE_DISK_GUIDE_IMAGE_URL", "").strip()
+LICENSE_DISK_GUIDE_IMAGE_CAPTION = os.getenv(
+    "LICENSE_DISK_GUIDE_IMAGE_CAPTION",
+    "Here’s where to find the company name on the license disk.",
+)
 MYSQL_HOST = _env("MYSQL_HOST")
 MYSQL_PORT = int(_env("MYSQL_PORT", "3306"))
 MYSQL_DB   = _env("MYSQL_DB") or _env("MYSQL_SCHEMA") or "mnc_report"
 MYSQL_USER = _env("MYSQL_USER")
 MYSQL_PASS = _env("MYSQL_PASSWORD") or _env("MYSQL_PASS") or _env("MYSQL_PWD")
+
+DRIVER_APPLICATION_TABLE = f"{MYSQL_DB}.driver_applications"
+DRIVER_APPLICATION_DEDUPE_WINDOW_SECONDS = int(
+    os.getenv("DRIVER_APPLICATION_DEDUPE_WINDOW_SECONDS", str(60 * 60))
+)
+DRIVER_APPLICATION_BOOLEAN_FIELDS = {
+    "has_drivers_license",
+    "has_prdp",
+    "consent_given",
+    "contact_consent",
+}
+DRIVER_APPLICATION_FORM_FIELDS = [
+    "first_name",
+    "surname",
+    "phone_number",
+    "email",
+    "id_or_passport",
+    "city",
+    "parking_suburb",
+    "has_drivers_license",
+    "has_prdp",
+    "driving_experience",
+    "primary_platform",
+    "weekly_earnings",
+    "daily_hours",
+    "heard_about_us",
+    "vehicle_interest",
+    "deposit_available",
+    "consent_given",
+    "contact_consent",
+    "referral_code",
+    "notes",
+]
+DRIVER_APPLICATION_NUMERIC_FIELDS = {"daily_hours"}
 
 try:
     import pymysql
@@ -411,6 +1232,20 @@ def _get_table_columns(conn, fqtn: str) -> set[str]:
         cols = {row["COLUMN_NAME"] for row in (cur.fetchall() or [])}
     cache[fqtn] = cols
     return cols
+
+def _get_column_info(conn, fqtn: str, column: str) -> Optional[Dict[str, Any]]:
+    sch, tbl = _split_schema_table(fqtn)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DATA_TYPE, COLUMN_TYPE
+            FROM information_schema.columns
+            WHERE table_schema=%s AND table_name=%s AND column_name=%s
+            LIMIT 1
+            """,
+            (sch, tbl, column),
+        )
+        return cur.fetchone()
 
 def _pick_col_exists(conn, table_fq: str, candidates: List[str]) -> Optional[str]:
     sch, tbl = _split_schema_table(table_fq)
@@ -554,6 +1389,226 @@ def generate_statement_pdf(wa_id: str, display_name: str, statement_data: List[D
         pdf_output = bytes(pdf_output_bytearray)
     return pdf_output
 
+
+# -----------------------------------------------------------------------------
+# Driver application helpers
+# -----------------------------------------------------------------------------
+def _driver_application_timestamp_column(columns: set[str]) -> Optional[str]:
+    if not columns:
+        return None
+    if "submitted_at" in columns:
+        return "submitted_at"
+    if "created_at" in columns:
+        return "created_at"
+    return None
+
+
+def _ensure_driver_applications_columns(conn) -> None:
+    if not _table_exists(conn, DRIVER_APPLICATION_TABLE):
+        return
+    try:
+        cols = _get_table_columns(conn, DRIVER_APPLICATION_TABLE)
+    except Exception:
+        return
+
+    phone_missing = "phone_number_clean" not in cols
+    weekly_needs_varchar = False
+
+    if "weekly_earnings" in cols:
+        info = _get_column_info(conn, DRIVER_APPLICATION_TABLE, "weekly_earnings")
+        if info:
+            data_type = (info.get("DATA_TYPE") or "").lower()
+            if data_type not in {"char", "varchar", "tinytext", "text", "mediumtext", "longtext"}:
+                weekly_needs_varchar = True
+        else:
+            weekly_needs_varchar = False
+
+    if not phone_missing and not weekly_needs_varchar:
+        return
+
+    try:
+        with conn.cursor() as cur:
+            if phone_missing:
+                cur.execute(
+                    f"""
+                    ALTER TABLE {DRIVER_APPLICATION_TABLE}
+                    ADD COLUMN phone_number_clean VARCHAR(32) NULL
+                    """
+                )
+            if weekly_needs_varchar:
+                cur.execute(
+                    f"""
+                    ALTER TABLE {DRIVER_APPLICATION_TABLE}
+                    MODIFY COLUMN weekly_earnings VARCHAR(64) NULL
+                    """
+                )
+    except Exception as exc:
+        log.warning("Failed to ensure driver application columns: %s", exc)
+        return
+
+    if hasattr(_get_table_columns, "_cache"):
+        _get_table_columns._cache.pop(DRIVER_APPLICATION_TABLE, None)
+
+
+def _ensure_issue_ticket_columns(conn) -> None:
+    if not _table_exists(conn, ISSUE_TICKET_TABLE):
+        return
+    try:
+        cols = _get_table_columns(conn, ISSUE_TICKET_TABLE)
+    except Exception:
+        return
+
+    needs_assignee = "assigned_admin_email" not in cols
+    if not needs_assignee:
+        return
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                ALTER TABLE {ISSUE_TICKET_TABLE}
+                ADD COLUMN assigned_admin_email VARCHAR(255) NULL
+                AFTER status
+                """
+            )
+    except Exception as exc:
+        log.warning("Failed to ensure issue ticket columns: %s", exc)
+        return
+
+    if hasattr(_get_table_columns, "_cache"):
+        _get_table_columns._cache.pop(ISSUE_TICKET_TABLE, None)
+
+
+def _recent_driver_application_entry(
+    phone_clean: Optional[str],
+    email_normalized: Optional[str],
+    *,
+    window_seconds: int = DRIVER_APPLICATION_DEDUPE_WINDOW_SECONDS,
+) -> Optional[Dict[str, Any]]:
+    if not mysql_available():
+        return None
+    if not (phone_clean or email_normalized):
+        return None
+    conn = get_mysql()
+    if not _table_exists(conn, DRIVER_APPLICATION_TABLE):
+        return None
+    cols = _get_table_columns(conn, DRIVER_APPLICATION_TABLE)
+    identity_clauses: List[str] = []
+    params: List[Any] = []
+    if phone_clean and "phone_number_clean" in cols:
+        identity_clauses.append("phone_number_clean=%s")
+        params.append(phone_clean)
+    if email_normalized and "email" in cols:
+        identity_clauses.append("LOWER(email)=%s")
+        params.append(email_normalized)
+    if not identity_clauses:
+        return None
+    timestamp_col = _driver_application_timestamp_column(cols)
+    if not timestamp_col:
+        return None
+    cutoff = datetime.utcnow() - timedelta(seconds=window_seconds)
+    params.append(cutoff.strftime("%Y-%m-%d %H:%M:%S"))
+    query = (
+        f"SELECT id, phone_number, email, {timestamp_col} AS submitted_at "
+        f"FROM {DRIVER_APPLICATION_TABLE} "
+        f"WHERE ({' OR '.join(identity_clauses)}) "
+        f"AND {timestamp_col} >= %s "
+        f"ORDER BY {timestamp_col} DESC "
+        f"LIMIT 1"
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(query, tuple(params))
+            return cur.fetchone()
+    except Exception as exc:
+        log.debug("Recent driver application query failed: %s", exc)
+        return None
+
+
+def _insert_driver_application(data: Dict[str, Any], phone_clean: Optional[str]) -> Optional[int]:
+    if not mysql_available():
+        return None
+    conn = get_mysql()
+    if not _table_exists(conn, DRIVER_APPLICATION_TABLE):
+        return None
+    cols = _get_table_columns(conn, DRIVER_APPLICATION_TABLE)
+    payload: Dict[str, Any] = {}
+    for key, value in data.items():
+        if key not in cols:
+            continue
+        if key in DRIVER_APPLICATION_NUMERIC_FIELDS:
+            numeric = _coerce_driver_application_decimal(value)
+            if numeric is None:
+                continue
+            payload[key] = numeric
+        else:
+            payload[key] = value
+    if phone_clean and "phone_number_clean" in cols:
+        payload["phone_number_clean"] = phone_clean
+    timestamp_col = _driver_application_timestamp_column(cols)
+    if timestamp_col == "submitted_at":
+        payload["submitted_at"] = jhb_now().strftime("%Y-%m-%d %H:%M:%S")
+    if not payload:
+        return None
+    columns = ", ".join(payload.keys())
+    placeholders = ", ".join(["%s"] * len(payload))
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"INSERT INTO {DRIVER_APPLICATION_TABLE} ({columns}) VALUES ({placeholders})",
+                tuple(payload.values()),
+            )
+            inserted = cur.lastrowid
+        return int(inserted) if inserted else None
+    except Exception as exc:
+        log.error("Failed to insert driver application: %s", exc)
+        return None
+
+
+def _extract_driver_application_form(form: Any) -> Dict[str, Any]:
+    data: Dict[str, Any] = {}
+    for field in DRIVER_APPLICATION_FORM_FIELDS:
+        raw = form.get(field)
+        if field in DRIVER_APPLICATION_BOOLEAN_FIELDS:
+            data[field] = _yes_no(raw)
+        else:
+            data[field] = str(raw).strip() if raw is not None else ""
+    return data
+def _yes_no(val: Any) -> str:
+    if val in (None, ""):
+        return ""
+    normalized = str(val).strip()
+    if not normalized:
+        return ""
+    lowered = normalized.lower()
+    truthy = {"1", "true", "yes", "y", "t", "on"}
+    falsey = {"0", "false", "no", "n", "nah", "never"}
+    if lowered in truthy:
+        return "Yes"
+    if lowered in falsey:
+        return "No"
+    # Keep longer explanations intact instead of collapsing to a generic "No".
+    if len(normalized) <= 6:
+        return normalized
+    return normalized
+
+
+def _coerce_driver_application_decimal(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    cleaned = re.sub(r"[^0-9.\-]+", "", text)
+    if not cleaned or cleaned in {"-", ".", "-."}:
+        return None
+    try:
+        return float(cleaned)
+    except Exception:
+        return None
+
+
+
 # -----------------------------------------------------------------------------
 # Ensure context table
 # -----------------------------------------------------------------------------
@@ -640,6 +1695,7 @@ def ensure_schema():
               wa_id VARCHAR(32) NOT NULL,
               issue_type VARCHAR(32) NOT NULL,
               status VARCHAR(32) NOT NULL DEFAULT 'open',
+              assigned_admin_email VARCHAR(255) NULL,
               initial_message LONGTEXT NULL,
               media_urls JSON NULL,
               location_lat DECIMAL(10,7) NULL,
@@ -677,8 +1733,168 @@ def ensure_schema():
               KEY idx_ticket_logs_ticket (ticket_id),
               KEY idx_ticket_logs_created (created_at)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;""")
+        _ensure_driver_applications_columns(conn)
+        _ensure_issue_ticket_columns(conn)
+        _ensure_issue_learning_table()
+        _ensure_email_tables()
+        _ensure_email_logs_table()
     except Exception as e:
         log.warning("ensure_schema skipped: %s", e)
+
+
+_ISSUE_LEARNING_KEYWORD_CACHE: Dict[str, List[str]] = {}
+_ISSUE_LEARNING_KEYWORD_CACHE_UPDATED_AT: float = 0.0
+_ISSUE_LEARNING_FETCH_LIMIT = 2000
+
+
+def _ensure_issue_learning_table() -> None:
+    if not mysql_available():
+        return
+    try:
+        conn = get_mysql()
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {ISSUE_LEARNING_TABLE} (
+                    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                    wa_id VARCHAR(32) NOT NULL,
+                    message_text LONGTEXT NOT NULL,
+                    resolved_intent VARCHAR(64) NOT NULL,
+                    resolved_label VARCHAR(64) NULL,
+                    metadata JSON NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (id),
+                    KEY idx_issue_learning_label (resolved_label),
+                    KEY idx_issue_learning_intent (resolved_intent),
+                    KEY idx_issue_learning_wa (wa_id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            """)
+    except Exception as exc:
+        log.debug("Failed to ensure issue learning table: %s", exc)
+
+
+def _derive_issue_label(issue_type: Optional[str], message_text: str) -> str:
+    base_label = (issue_type or "unknown").strip().lower()
+    if not base_label:
+        base_label = "unknown"
+    if base_label == "car_problem":
+        reason = _towing_reason(message_text) or "general"
+        return f"{base_label}:{reason}"
+    if base_label in {"no_vehicle", "no_vehicle_other"}:
+        reason = _parse_no_vehicle_reason(message_text) or "other"
+        return f"{base_label}:{reason}"
+    if base_label == "vehicle_repossession":
+        reason = _parse_repossession_reason(message_text) or "other"
+        return f"{base_label}:{reason}"
+    return base_label
+
+
+def _record_issue_learning_case(
+    wa_id: str,
+    message_text: str,
+    resolved_intent: Optional[str],
+    resolved_label: Optional[str] = None,
+    *,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    if not (mysql_available() and wa_id and message_text and resolved_intent):
+        return
+    payload_label = resolved_label or _derive_issue_label(resolved_intent, message_text)
+    meta_json = json.dumps(metadata, ensure_ascii=False) if metadata else None
+    try:
+        conn = get_mysql()
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO {ISSUE_LEARNING_TABLE}
+                  (wa_id, message_text, resolved_intent, resolved_label, metadata)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (
+                    wa_id,
+                    message_text,
+                    resolved_intent,
+                    payload_label,
+                    meta_json,
+                ),
+            )
+    except Exception as exc:
+        log.debug("Failed to record issue learning case: %s", exc)
+
+
+def _refresh_issue_learning_keyword_cache() -> Dict[str, List[str]]:
+    global _ISSUE_LEARNING_KEYWORD_CACHE, _ISSUE_LEARNING_KEYWORD_CACHE_UPDATED_AT
+    if not mysql_available():
+        return _ISSUE_LEARNING_KEYWORD_CACHE
+    try:
+        conn = get_mysql()
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT resolved_label, message_text
+                FROM {ISSUE_LEARNING_TABLE}
+                WHERE message_text IS NOT NULL AND message_text <> ''
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (_ISSUE_LEARNING_FETCH_LIMIT,)
+            )
+            rows = cur.fetchall() or []
+    except Exception as exc:
+        log.debug("Failed to refresh issue learning keywords: %s", exc)
+        return _ISSUE_LEARNING_KEYWORD_CACHE
+
+    counters: Dict[str, Counter] = {}
+    for row in rows:
+        label_raw = (row.get("resolved_label") or row.get("resolved_intent") or "unknown").strip().lower()
+        label = label_raw.split(":", 1)[0] if label_raw else "unknown"
+        if not label or label == "unknown":
+            continue
+        text = row.get("message_text") or ""
+        tokens = set(re.findall(r"[a-z']+", _normalize_text(text).lower()))
+        if not tokens:
+            continue
+        counter = counters.setdefault(label, Counter())
+        counter.update(tokens)
+
+    cache: Dict[str, List[str]] = {}
+    for label, counter in counters.items():
+        keywords = [word for word, _ in counter.most_common(50)]
+        if keywords:
+            cache[label] = keywords
+
+    _ISSUE_LEARNING_KEYWORD_CACHE = cache
+    _ISSUE_LEARNING_KEYWORD_CACHE_UPDATED_AT = time.time()
+    return cache
+
+
+def _get_issue_learning_keywords() -> Dict[str, List[str]]:
+    if (
+        time.time() - _ISSUE_LEARNING_KEYWORD_CACHE_UPDATED_AT
+        < ISSUE_LEARNING_KEYWORD_TTL_SECONDS
+        and _ISSUE_LEARNING_KEYWORD_CACHE
+    ):
+        return _ISSUE_LEARNING_KEYWORD_CACHE
+    return _refresh_issue_learning_keyword_cache()
+
+
+def _learning_label_from_message(text: str) -> Optional[str]:
+    if not text:
+        return None
+    keywords = _get_issue_learning_keywords()
+    if not keywords:
+        return None
+    tokens = set(re.findall(r"[a-z']+", _normalize_text(text).lower()))
+    best_label = None
+    best_score = 0.0
+    for label, words in keywords.items():
+        if not words:
+            continue
+        matches = tokens & set(words)
+        score = len(matches) / len(words)
+        if score > best_score and score >= 0.25:
+            best_score = score
+            best_label = label
+    return best_label
 
 # -----------------------------------------------------------------------------
 # OpenAI helpers (optional)
@@ -729,6 +1945,27 @@ def _json_dumps(value: Any, *, pretty: bool = False) -> str:
 def save_context_file(wa_id: str, ctx: Dict[str, Any]) -> None:
     _ctx_path(wa_id).write_text(_json_dumps(ctx, pretty=True), encoding="utf-8")
 
+def _dedupe_inbound_message(ctx: Dict[str, Any], msg_id: Optional[str]) -> bool:
+    if not msg_id or not isinstance(ctx, dict):
+        return False
+    bucket = ctx.get("_recent_inbound_ids")
+    if not isinstance(bucket, dict):
+        bucket = {}
+    now = time.time()
+    for key, ts in list(bucket.items()):
+        try:
+            if now - float(ts) > INBOUND_DEDUPE_TTL_SECONDS:
+                bucket.pop(key, None)
+        except Exception:
+            bucket.pop(key, None)
+    duplicate = msg_id in bucket
+    bucket[msg_id] = now
+    if len(bucket) > INBOUND_DEDUPE_MAX_IDS:
+        ordered = sorted(bucket.items(), key=lambda kv: kv[1], reverse=True)[:INBOUND_DEDUPE_MAX_IDS]
+        bucket = {k: v for k, v in ordered}
+    ctx["_recent_inbound_ids"] = bucket
+    return duplicate
+
 def _record_outbound_template_context(
     wa_id: str,
     template_id: str,
@@ -748,13 +1985,14 @@ def _record_outbound_template_context(
             key = str(name or "").strip()
             if key:
                 named[key] = params[idx]
-    ctx["_last_outbound_template"] = {
-        "id": template_id,
-        "sent_at": time.time(),
-        "params": params,
-        "params_named": named,
-        "parameter_format": parameter_format,
-    }
+    if not _should_skip_template_context(template_id):
+        ctx["_last_outbound_template"] = {
+            "id": template_id,
+            "sent_at": time.time(),
+            "params": params,
+            "params_named": named,
+            "parameter_format": parameter_format,
+        }
     if str(template_id or "").startswith("performance_no_trips_yet"):
         ctx["_awaiting_goal_confirm"] = True
         ctx["_awaiting_goal_set_at"] = time.time()
@@ -762,6 +2000,13 @@ def _record_outbound_template_context(
         ctx["_awaiting_performance_tips"] = True
         ctx["_performance_tips_set_at"] = time.time()
     save_context_file(wa_id, ctx)
+
+
+def _should_skip_template_context(template_id: Optional[str]) -> bool:
+    if not template_id:
+        return False
+    normalized = str(template_id).strip().lower()
+    return any(normalized.startswith(prefix) for prefix in SKIP_TEMPLATE_CONTEXT_PREFIXES)
 
 def _recent_outbound_template(ctx: Dict[str, Any], template_id: str, *, max_age_hours: int = 72) -> Optional[Dict[str, Any]]:
     payload = ctx.get("_last_outbound_template")
@@ -1014,6 +2259,9 @@ def _extract_schedule_hint(text: str) -> str:
 def _is_schedule_update(text: str) -> bool:
     if not text:
         return False
+    # Skip schedule detection when the message clearly signals a payment plan.
+    if _is_payment_plan_request(text):
+        return False
     lowered = _normalize_text(text).lower()
     if "tomorrow" in lowered or "tmr" in lowered or "next week" in lowered:
         return True
@@ -1055,7 +2303,7 @@ def _build_clarify_reply(msg: str, ctx: Dict[str, Any], driver: Dict[str, Any]) 
         if choice == "1":
             return "Got it — vehicle issue. Is it in the workshop/maintenance, no car/replacement, accident, or something else?"
         if choice == "2":
-            login_url = "https://60b9b868ac0b.ngrok-free.app/driver/login"
+            login_url = "mynextcar.ngrok.io/driver/login"
             return (
                 f"You can check your balance here: {login_url}. "
                 "Use your personal code (South African ID number, or Traffic Register Number (TRN) for foreign nationals from your PrDP)."
@@ -1064,6 +2312,10 @@ def _build_clarify_reply(msg: str, ctx: Dict[str, Any], driver: Dict[str, Any]) 
             return "Got it — performance targets. Do you want today’s trips, your weekly target, or tips on times/areas?"
         if choice == "4":
             return "Got it — account/block or app issue. Are you seeing a suspension message, or is the app/login not working?"
+    if _is_towing_request(raw):
+        reason = _towing_reason(raw)
+        return _build_towing_reply(reason, ctx, driver, message=raw)
+
     def _maybe_add_commitment_probe(text: str) -> str:
         if not text:
             return text
@@ -1147,7 +2399,7 @@ def _build_clarify_reply(msg: str, ctx: Dict[str, Any], driver: Dict[str, Any]) 
             )
             return f"{target_line}{prompt}".strip()
     if "balance" in lowered or "outstanding" in lowered or "owe" in lowered:
-        login_url = "https://60b9b868ac0b.ngrok-free.app/driver/login"
+        login_url = "mynextcar.ngrok.io/driver/login"
         return _pick_phrase(
             [
                 f"You can check your balance here: {login_url}. Use your personal code (South African ID number, or Traffic Register Number (TRN) for foreign nationals from your PrDP).",
@@ -1219,9 +2471,12 @@ def save_context_db(wa_id: str, last_intent: str, last_reply: str, prefs: Dict[s
 # Driver issue ticket helpers (car problems etc.)
 # -----------------------------------------------------------------------------
 ISSUE_TICKET_TABLE = f"{MYSQL_DB}.driver_issue_tickets"
+ISSUE_LEARNING_TABLE = f"{MYSQL_DB}.driver_issue_learning"
 ADMIN_TABLE = f"{MYSQL_DB}.driver_issue_admins"
 _admin_manage_flag_supported: Optional[bool] = None
 INTERACTION_TABLE = f"{MYSQL_DB}.driver_interactions"
+EMAIL_TEMPLATE_TABLE = f"{MYSQL_DB}.driver_email_templates"
+EMAIL_LOG_TABLE = f"{MYSQL_DB}.driver_email_logs"
 ENGAGEMENT_CAMPAIGN_TABLE = f"{MYSQL_DB}.driver_engagement_campaigns"
 ENGAGEMENT_ROW_TABLE = f"{MYSQL_DB}.driver_engagement_rows"
 ENGAGEMENT_RESPONSE_WINDOW_DAYS = int(os.getenv("ENGAGEMENT_RESPONSE_WINDOW_DAYS", "3"))
@@ -1237,6 +2492,7 @@ GOAL_TARGET_TTL_DAYS = int(os.getenv("GOAL_TARGET_TTL_DAYS", "14"))
 PERFORMANCE_FOLLOWUP_TTL_HOURS = int(os.getenv("PERFORMANCE_FOLLOWUP_TTL_HOURS", "24"))
 REPOSSESSION_PROMPT_COOLDOWN_HOURS = int(os.getenv("REPOSSESSION_PROMPT_COOLDOWN_HOURS", "6"))
 COMMITMENT_PROMPT_COOLDOWN_HOURS = int(os.getenv("COMMITMENT_PROMPT_COOLDOWN_HOURS", "24"))
+ISSUE_LEARNING_KEYWORD_TTL_SECONDS = int(os.getenv("ISSUE_LEARNING_KEYWORD_TTL_SECONDS", "600"))
 
 
 def create_driver_issue_ticket(
@@ -1245,6 +2501,9 @@ def create_driver_issue_ticket(
     driver: Dict[str, Any],
     *,
     issue_type: str = "car_problem",
+    status: str = "collecting",
+    location_desc: Optional[str] = None,
+    metadata_extra: Optional[Dict[str, Any]] = None,
 ) -> Optional[int]:
     if not mysql_available():
         return None
@@ -1253,28 +2512,196 @@ def create_driver_issue_ticket(
         "asset_model": driver.get("asset_model"),
         "created_at_ts": time.time(),
     }
+    if metadata_extra:
+        metadata.update(metadata_extra)
     try:
+        status_value = (status or "collecting").strip() or "collecting"
+        desc_value = location_desc.strip() if location_desc else None
         conn = get_mysql()
         with conn.cursor() as cur:
             cur.execute(
                 f"""
                 INSERT INTO {ISSUE_TICKET_TABLE}
-                  (wa_id, issue_type, status, initial_message, media_urls, metadata)
-                VALUES (%s, %s, %s, %s, JSON_ARRAY(), %s)
+                  (wa_id, issue_type, status, initial_message, media_urls, location_desc, metadata)
+                VALUES (%s, %s, %s, %s, JSON_ARRAY(), %s, %s)
                 """,
                 (
                     wa_id,
                     issue_type,
-                    "collecting",
+                    status_value,
                     initial_message,
+                    desc_value,
                     json.dumps(metadata, ensure_ascii=False),
                 ),
             )
             ticket_id = cur.lastrowid
-        return int(ticket_id) if ticket_id else None
+        if ticket_id:
+            _record_issue_learning_case(
+                wa_id,
+                initial_message,
+                issue_type,
+                resolved_label=_derive_issue_label(issue_type, initial_message),
+                metadata={"issue_source": "ticket_create"},
+            )
+            return int(ticket_id)
+        return None
     except Exception as exc:
         log.error("create_driver_issue_ticket failed: %s", exc)
         return None
+
+
+def _admin_ticket_display_name(profile: Optional[Dict[str, Any]]) -> str:
+    if not profile:
+        return "Driver"
+    name = profile.get("display_name") or profile.get("full_name")
+    if name and name.strip():
+        return name.strip()
+    first = profile.get("first_name")
+    last = profile.get("last_name")
+    if first or last:
+        combined = f"{first or ''} {last or ''}".strip()
+        if combined:
+            return combined
+    return "Driver"
+
+
+def _admin_ticket_template_amount(initial_message: str, profile: Dict[str, Any]) -> str:
+    parsed = _parse_payment_amount(initial_message)
+    if parsed is None:
+        parsed = _coerce_float(profile.get("xero_balance"))
+    if parsed is None:
+        return fmt_rands(0.0)
+    return fmt_rands(parsed)
+
+
+def _build_admin_ticket_template_params(
+    template: Dict[str, Any],
+    profile: Dict[str, Any],
+    initial_message: str,
+    ticket_id: int,
+) -> Optional[Dict[str, str]]:
+    if not template:
+        return None
+    display_name = _admin_ticket_display_name(profile)
+    amount_text = _admin_ticket_template_amount(initial_message, profile)
+    params: Dict[str, str] = {}
+    ticket_ref = f"Ticket #{ticket_id}"
+    variables = template.get("variables") or []
+    for var in variables:
+        key = (var or "").strip()
+        norm = key.lower()
+        if norm == "name":
+            value = display_name
+        elif norm in {"amount", "xero_balance"}:
+            value = amount_text
+        elif norm == "reference":
+            value = ticket_ref
+        elif norm == "online_hours":
+            hours = _coerce_float(profile.get("online_hours"))
+            value = str(int(hours)) if hours is not None else "0"
+        elif norm == "trip_count":
+            trips = _coerce_float(profile.get("trip_count"))
+            value = str(int(trips)) if trips is not None else "0"
+        elif norm == "acceptance_rate":
+            pct = _coerce_float(profile.get("acceptance_rate"))
+            value = f"{pct:.1f}%" if pct is not None else "0%"
+        else:
+            value = initial_message or ticket_ref
+        if not value:
+            value = ticket_ref
+        params[key] = value
+    return params if params else None
+
+
+def _ensure_issue_ticket(
+    ctx: Dict[str, Any],
+    wa_id: str,
+    msg: str,
+    driver: Dict[str, Any],
+    *,
+    issue_type: str,
+    ctx_key: str,
+    existing_types: Optional[List[str]] = None,
+) -> Optional[int]:
+    ticket_ctx = ctx.get(ctx_key) if isinstance(ctx.get(ctx_key), dict) else None
+    if ticket_ctx and _ticket_ctx_is_closed(ticket_ctx, ctx):
+        ctx.pop(ctx_key, None)
+        ticket_ctx = None
+    ticket_id = ticket_ctx.get("ticket_id") if ticket_ctx else None
+    if not ticket_id and existing_types:
+        existing = fetch_open_driver_issue_ticket(wa_id, existing_types)
+        if existing:
+            ticket_id = existing.get("id")
+    if not ticket_id:
+        ticket_id = create_driver_issue_ticket(wa_id, msg, driver, issue_type=issue_type)
+    ctx[ctx_key] = {
+        "ticket_id": ticket_id,
+        "status": (ticket_ctx or {}).get("status") or "collecting",
+        "opened_at": (ticket_ctx or {}).get("opened_at") or time.time(),
+    }
+    return ticket_id
+
+
+def _ensure_payment_plan_ticket(
+    ctx: Dict[str, Any],
+    wa_id: str,
+    driver: Dict[str, Any],
+    *,
+    amount: Optional[float],
+    due_date: Optional[date],
+    message: Optional[str],
+) -> Optional[int]:
+    if not mysql_available() or not wa_id:
+        return None
+    ticket_ctx = ctx.get("_payment_plan_ticket")
+    if isinstance(ticket_ctx, dict) and not _ticket_ctx_is_closed(ticket_ctx, ctx):
+        ticket_id = ticket_ctx.get("ticket_id")
+    else:
+        note_parts = ["Payment plan commitment recorded."]
+        if amount is not None:
+            note_parts.append(f"Amount: {fmt_rands(amount)}")
+        if due_date:
+            note_parts.append(f"Due by {due_date.strftime('%Y-%m-%d')}")
+        else:
+            note_parts.append(f"Due within {PAYMENT_PLAN_WINDOW_DAYS} days")
+        summary = " ".join(note_parts)
+        if message:
+            summary = f"{summary} Reference: {message[:200]}"
+        ticket_id = create_driver_issue_ticket(wa_id, summary, driver, issue_type="payment_plan")
+        ticket_ctx = {
+            "ticket_id": ticket_id,
+            "status": "collecting" if ticket_id else "collecting",
+            "opened_at": time.time(),
+        }
+    if not ticket_id:
+        return None
+    metadata_patch: Dict[str, Any] = {}
+    if amount is not None:
+        metadata_patch["payment_plan_amount"] = amount
+    if due_date:
+        metadata_patch["payment_plan_due"] = due_date.isoformat()
+    metadata_patch["payment_plan_logged_at"] = jhb_now().strftime("%Y-%m-%d %H:%M:%S")
+    if metadata_patch:
+        update_driver_issue_metadata(ticket_id, metadata_patch)
+    ticket_ctx["payment_plan_amount"] = amount
+    ticket_ctx["payment_plan_due"] = due_date.isoformat() if due_date else None
+    ticket_ctx["payment_plan_logged_at"] = metadata_patch["payment_plan_logged_at"]
+    ctx["_payment_plan_ticket"] = ticket_ctx
+    ctx.pop("_cash_ticket", None)
+    ctx["_active_concern"] = {
+        "type": "payment_plan",
+        "opened_at": ticket_ctx.get("opened_at", time.time()),
+        "message": (message or "")[:160],
+    }
+    log_driver_issue_ticket_event(
+        ticket_id,
+        admin_email=None,
+        action_type="payment_plan_recorded",
+        from_status=ticket_ctx.get("status"),
+        to_status=ticket_ctx.get("status"),
+        note=f"Plan due {metadata_patch.get('payment_plan_due')} amount {fmt_rands(amount) if amount is not None else 'TBD'}",
+    )
+    return ticket_id
 
 
 def append_driver_issue_media(ticket_id: int, media: Dict[str, Any]) -> bool:
@@ -1311,9 +2738,18 @@ def update_driver_issue_location(
     longitude: Optional[float],
     description: Optional[str] = None,
     raw: Optional[Dict[str, Any]] = None,
+    mark_received: bool = True,
 ) -> bool:
     if not (mysql_available() and ticket_id):
         return False
+    if mark_received:
+        metadata_expr = (
+            "JSON_SET(IFNULL(metadata, JSON_OBJECT()), "
+            "'$.location_received', TRUE, "
+            "'$.location_raw', CAST(%s AS JSON))"
+        )
+    else:
+        metadata_expr = "JSON_SET(IFNULL(metadata, JSON_OBJECT()), '$.location_raw', CAST(%s AS JSON))"
     try:
         conn = get_mysql()
         with conn.cursor() as cur:
@@ -1323,11 +2759,7 @@ def update_driver_issue_location(
                 SET location_lat=%s,
                     location_lng=%s,
                     location_desc=%s,
-                    metadata = JSON_SET(
-                        IFNULL(metadata, JSON_OBJECT()),
-                        '$.location_received', TRUE,
-                        '$.location_raw', CAST(%s AS JSON)
-                    ),
+                    metadata = {metadata_expr},
                     last_update_at = CURRENT_TIMESTAMP
                 WHERE id=%s
                 """,
@@ -1418,6 +2850,757 @@ def log_driver_issue_ticket_event(
         log.warning("log_driver_issue_ticket_event failed: %s", exc)
 
 
+ISSUE_TYPE_LABELS = {
+    "accident": "accident",
+    "account_suspension": "account suspension",
+    "app_issue": "app issue",
+    "balance_dispute": "balance dispute",
+    "payment_plan": "payment plan",
+    "branding_bonus": "branding bonus",
+    "branding_campaign": "branding campaign",
+    "car_problem": "vehicle issue",
+    "cash_ride": "cash rides",
+    "finance_followup": "finance follow-up",
+    "low_demand": "low demand",
+    "license_disk_renewal": "license disk renewal",
+    "medical_pause": "medical pause",
+    "no_vehicle_other": "no vehicle",
+    "pop_submission": "payment POP",
+    "safety_incident": "safety incident",
+    "vehicle_category": "vehicle category",
+    "workshop_followup": "workshop follow-up",
+}
+
+LOCATION_RELEVANT_ISSUE_TYPES = {
+    "car_problem",
+    "accident",
+    "safety_incident",
+    "medical_pause",
+}
+
+ISSUE_CONFIG_PATH = Path(os.getenv("ISSUE_CONFIG_PATH", str(BASE_DIR / "issue_config.json")))
+
+def _normalize_issue_key(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    cleaned = str(value).strip().lower().replace(" ", "_")
+    cleaned = re.sub(r"[^a-z0-9_]+", "_", cleaned)
+    return cleaned.strip("_")
+
+def _issue_label_from_key(key: str) -> str:
+    return key.replace("_", " ").strip() or "issue"
+
+def _sanitize_issue_statuses(values: Any) -> List[str]:
+    if values is None:
+        return []
+    raw_list: List[Any]
+    if isinstance(values, (list, tuple, set)):
+        raw_list = list(values)
+    else:
+        raw_list = [values]
+    cleaned: List[str] = []
+    seen: set[str] = set()
+    for raw in raw_list:
+        if raw is None:
+            continue
+        for part in str(raw).split(","):
+            status = _normalize_status_value(part)
+            if not status or status in seen:
+                continue
+            seen.add(status)
+            cleaned.append(status)
+    return cleaned
+
+def _sanitize_issue_keywords(values: Any) -> List[str]:
+    if values is None:
+        return []
+    raw_list: List[Any]
+    if isinstance(values, (list, tuple, set)):
+        raw_list = list(values)
+    else:
+        raw_list = [values]
+    cleaned: List[str] = []
+    seen: set[str] = set()
+    for raw in raw_list:
+        if raw is None:
+            continue
+        for part in re.split(r"[,\n;]+", str(raw)):
+            kw = re.sub(r"\s+", " ", str(part)).strip().lower()
+            if not kw:
+                continue
+            if kw in seen:
+                continue
+            seen.add(kw)
+            cleaned.append(kw)
+    return cleaned
+
+def _sanitize_issue_instructions(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+_INSTRUCTION_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+", flags=re.UNICODE)
+_INSTRUCTION_OPS_KEYWORDS = {
+    "email",
+    "ops",
+    "ai",
+    "admin",
+    "escalate",
+    "internal",
+    "capture",
+    "send",
+}
+_INSTRUCTION_EMAIL_RE = re.compile(r"[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}")
+
+def _combine_issue_instructions(driver: Any, ops: Any) -> str:
+    values: List[str] = []
+    for raw in (driver, ops):
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if text:
+            values.append(text)
+    return " ".join(values).strip()
+
+def _split_issue_instruction_sentences(value: str) -> List[str]:
+    if not value:
+        return []
+    parts = [part.strip() for part in _INSTRUCTION_SENTENCE_SPLIT_RE.split(value) if part.strip()]
+    return parts
+
+
+def _is_instruction_ops_sentence(sentence: str) -> bool:
+    if not sentence:
+        return False
+    lowered = sentence.lower()
+    if "@" in sentence:
+        return True
+    for keyword in _INSTRUCTION_OPS_KEYWORDS:
+        if re.search(rf"\b{keyword}\b", lowered):
+            return True
+    return False
+
+
+def _extract_issue_instruction_emails(value: str) -> List[str]:
+    if not value:
+        return []
+    return _INSTRUCTION_EMAIL_RE.findall(value)
+
+
+def _build_issue_instruction_plan(value: str) -> Dict[str, Any]:
+    trimmed = (value or "").strip()
+    if not trimmed:
+        return {}
+    sentences = _split_issue_instruction_sentences(trimmed)
+    driver_prompt = ""
+    ops_sentences: List[str] = []
+    email_addresses = _extract_issue_instruction_emails(trimmed)
+    for sentence in sentences:
+        if _is_instruction_ops_sentence(sentence):
+            ops_sentences.append(sentence)
+            continue
+        if not driver_prompt:
+            driver_prompt = sentence
+        else:
+            ops_sentences.append(sentence)
+    if not driver_prompt and sentences:
+        driver_prompt = sentences[0]
+    return {
+        "raw": trimmed,
+        "driver_prompt": driver_prompt.strip(),
+        "ops_instructions": " ".join(ops_sentences).strip(),
+        "email_recipient": email_addresses[0] if email_addresses else None,
+        "email_addresses": email_addresses,
+    }
+
+
+def _maybe_send_issue_instruction_email(
+    *,
+    wa_id: str,
+    driver: Dict[str, Any],
+    ctx: Dict[str, Any],
+    plan: Dict[str, Any],
+    issue_type: Optional[str],
+    media: Optional[Dict[str, Any]],
+) -> None:
+    if not media:
+        return
+    recipient = plan.get("email_recipient")
+    if not recipient:
+        return
+    media_url = media.get("url")
+    if not media_url:
+        return
+    plan_key = plan.get("issue_key") or (issue_type or "")
+    sent_map = ctx.get("_issue_instruction_email_sent")
+    if not isinstance(sent_map, dict):
+        sent_map = {}
+    media_identifier = media.get("id") or media_url
+    if plan_key and sent_map.get(plan_key) == media_identifier:
+        return
+    driver_name = (driver.get("display_name") or driver.get("first_name") or "Driver").strip()
+    ticket_label = plan.get("issue_label")
+    if not ticket_label and issue_type:
+        ticket_label = _issue_label_from_key(issue_type)
+    ticket_id = plan.get("ticket_id")
+    subject_parts = []
+    if ticket_label:
+        subject_parts.append(ticket_label.title())
+    if driver_name:
+        subject_parts.append(f"photo from {driver_name}")
+    subject = " ".join(subject_parts) or "Driver update"
+    body_parts: List[str] = [
+        f"Driver: {driver_name} ({wa_id})",
+        f"Issue: {ticket_label or issue_type or 'driver concern'}",
+        f"Ticket: {ticket_id or 'not available'}",
+    ]
+    instructions_text = plan.get("ops_instructions") or plan.get("driver_prompt") or plan.get("raw")
+    if instructions_text:
+        body_parts.append(f"Instructions: {instructions_text}")
+    caption = media.get("caption")
+    if caption:
+        body_parts.append(f"Caption: {caption}")
+    body_parts.append(f"Media type: {media.get('type') or 'unknown'}")
+    body_parts.append(f"Media URL: {media_url}")
+    body = "\n\n".join(body_parts)
+    sent_ok, message_id, thread_id = send_email_message(recipient, subject, body)
+    status = "sent" if sent_ok else "send_failed"
+    log_email_event(
+        direction="OUTBOUND",
+        email_address=recipient,
+        subject=subject,
+        body=body,
+        status=status,
+        wa_id=wa_id,
+        ticket_id=ticket_id,
+        raw_json={
+            "instruction_plan": plan.get("raw"),
+            "media_id": media.get("id"),
+            "media_type": media.get("type"),
+        },
+    )
+    if ticket_id:
+        metadata_patch: Dict[str, Any] = {
+            "issue_instruction_email_to": recipient,
+            "issue_instruction_email_status": status,
+            "issue_instruction_email_sent_at": jhb_now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        if media_identifier:
+            metadata_patch["issue_instruction_email_media_id"] = media_identifier
+        update_driver_issue_metadata(ticket_id, metadata_patch)
+    if plan_key:
+        sent_map[plan_key] = media_identifier
+        ctx["_issue_instruction_email_sent"] = sent_map
+
+def _issue_ticket_context(
+    ctx: Dict[str, Any],
+    issue_type: Optional[str],
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    if not issue_type:
+        return None, None
+    normalized = _normalize_issue_key(issue_type)
+    if not normalized:
+        return None, None
+    ctx_key = f"_issue_ticket_{normalized}"
+    ticket_ctx = ctx.get(ctx_key)
+    if not isinstance(ticket_ctx, dict):
+        return None, None
+    ticket_id = ticket_ctx.get("ticket_id")
+    if not ticket_id:
+        return None, None
+    ticket_ctx.setdefault("issue_type", normalized)
+    return ctx_key, ticket_ctx
+
+
+def _resolve_active_issue_context(ctx: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, Any]]]:
+    active_concern = ctx.get("_active_concern")
+    if isinstance(active_concern, dict):
+        issue_type = _normalize_issue_key(active_concern.get("type"))
+        if issue_type:
+            ctx_key, ticket_ctx = _issue_ticket_context(ctx, issue_type)
+            if ticket_ctx:
+                return issue_type, ctx_key, ticket_ctx
+    for key, value in ctx.items():
+        if not key.startswith("_issue_ticket_"):
+            continue
+        if not isinstance(value, dict):
+            continue
+        ticket_issue_type = value.get("issue_type") or key.replace("_issue_ticket_", "")
+        ticket_issue_type = _normalize_issue_key(ticket_issue_type)
+        if not ticket_issue_type:
+            continue
+        if not value.get("ticket_id"):
+            continue
+        value.setdefault("issue_type", ticket_issue_type)
+        return ticket_issue_type, key, value
+    return None, None, None
+
+
+def _maybe_process_issue_media_submission(
+    *,
+    issue_type: Optional[str],
+    ctx: Dict[str, Any],
+    wa_id: str,
+    driver: Dict[str, Any],
+    media: Optional[Dict[str, Any]],
+) -> Optional[int]:
+    if not media:
+        return None
+    ctx_key, ticket_ctx = _issue_ticket_context(ctx, issue_type)
+    if not ticket_ctx:
+        return None
+    ticket_id = ticket_ctx.get("ticket_id")
+    if not ticket_id:
+        return None
+    append_driver_issue_media(ticket_id, media)
+    issue_entry = _issue_config_entry(issue_type)
+    if not issue_entry:
+        return ticket_id
+    instructions = _sanitize_issue_instructions(issue_entry.get("instructions"))
+    if instructions:
+        plan = _build_issue_instruction_plan(instructions)
+        plan["issue_key"] = _normalize_issue_key(issue_type)
+        plan["issue_label"] = str(issue_entry.get("label") or _issue_label_from_key(plan["issue_key"]))
+        plan["ticket_id"] = ticket_id
+        _maybe_send_issue_instruction_email(
+            wa_id=wa_id,
+            driver=driver,
+            ctx=ctx,
+            plan=plan,
+            issue_type=plan["issue_key"],
+            media=media,
+        )
+    return ticket_id
+
+def _issue_config_entry(issue_key: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not issue_key:
+        return None
+    cleaned = _normalize_issue_key(issue_key)
+    if not cleaned:
+        return None
+    payload = ISSUE_TYPES_CONFIG.get(cleaned)
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("active") is False:
+        return None
+    return payload
+
+def _issue_payload_from_value(key: str, value: Any) -> Dict[str, Any]:
+    payload = dict(value) if isinstance(value, dict) else {}
+    payload["label"] = str(payload.get("label") or _issue_label_from_key(key)).strip()
+    payload["active"] = True if payload.get("active") is None else bool(payload.get("active"))
+    payload["statuses"] = _sanitize_issue_statuses(payload.get("statuses"))
+    payload["keywords"] = _sanitize_issue_keywords(payload.get("keywords"))
+    payload["instructions"] = _sanitize_issue_instructions(payload.get("instructions"))
+    return payload
+
+def _format_issue_keywords(value: Any) -> str:
+    keywords = _sanitize_issue_keywords(value)
+    return ", ".join(keywords)
+
+def _issue_keyword_in_text(keyword: str, text: str) -> bool:
+    if not keyword or not text:
+        return False
+    if " " in keyword or "-" in keyword:
+        return keyword in text
+    return bool(re.search(rf"\\b{re.escape(keyword)}\\b", text))
+
+def _match_issue_keywords(text: str) -> Optional[str]:
+    if not text:
+        return None
+    lowered = _normalize_text(text).lower()
+    best_key = None
+    best_len = 0
+    for key, payload in ISSUE_TYPES_CONFIG.items():
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("active") is False:
+            continue
+        keywords = _sanitize_issue_keywords(payload.get("keywords"))
+        if not keywords:
+            continue
+        for kw in keywords:
+            if _issue_keyword_in_text(kw, lowered):
+                score = len(kw)
+                if score > best_len:
+                    best_len = score
+                    best_key = key
+    return best_key
+
+def _load_issue_config() -> Dict[str, Dict[str, Any]]:
+    defaults = {
+        k: {"label": v, "active": True, "statuses": [], "keywords": [], "instructions": ""}
+        for k, v in ISSUE_TYPE_LABELS.items()
+    }
+    if not ISSUE_CONFIG_PATH.exists():
+        return {k: dict(v) for k, v in defaults.items()}
+    try:
+        raw = json.loads(ISSUE_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.warning("Failed to read issue config from %s: %s", ISSUE_CONFIG_PATH, exc)
+        return {k: dict(v) for k, v in defaults.items()}
+    if isinstance(raw, dict) and isinstance(raw.get("issues"), (dict, list)):
+        raw = raw.get("issues")
+    items: List[Tuple[str, Dict[str, Any]]] = []
+    if isinstance(raw, list):
+        for entry in raw:
+            if isinstance(entry, dict):
+                key = _normalize_issue_key(entry.get("key") or entry.get("id") or entry.get("value"))
+                label = (entry.get("label") or entry.get("name") or "").strip()
+                active = entry.get("active")
+                statuses = _sanitize_issue_statuses(entry.get("statuses"))
+                keywords = _sanitize_issue_keywords(entry.get("keywords"))
+                instructions = _sanitize_issue_instructions(entry.get("instructions"))
+            else:
+                key = _normalize_issue_key(entry)
+                label = ""
+                active = True
+                statuses = []
+                keywords = []
+                instructions = ""
+            if not key:
+                continue
+            items.append(
+                (
+                    key,
+                    {
+                        "label": label or _issue_label_from_key(key),
+                        "active": True if active is None else bool(active),
+                        "statuses": statuses,
+                        "keywords": keywords,
+                        "instructions": instructions,
+                    },
+                )
+            )
+    elif isinstance(raw, dict):
+        for key_raw, value in raw.items():
+            key = _normalize_issue_key(key_raw)
+            if not key:
+                continue
+            if isinstance(value, dict):
+                label = (value.get("label") or value.get("name") or "").strip()
+                active = value.get("active")
+                statuses = _sanitize_issue_statuses(value.get("statuses"))
+                keywords = _sanitize_issue_keywords(value.get("keywords"))
+                instructions = _sanitize_issue_instructions(value.get("instructions"))
+                entry = {
+                    "label": label or _issue_label_from_key(key),
+                    "active": True if active is None else bool(active),
+                    "statuses": statuses,
+                    "keywords": keywords,
+                    "instructions": instructions,
+                }
+            else:
+                entry = {
+                    "label": str(value or "").strip() or _issue_label_from_key(key),
+                    "active": True,
+                    "statuses": [],
+                    "keywords": [],
+                    "instructions": "",
+                }
+            items.append((key, entry))
+    merged = {k: dict(v) for k, v in defaults.items()}
+    for key, entry in items:
+        merged[key] = entry
+    return merged
+
+def _persist_issue_config(mapping: Dict[str, Dict[str, Any]]) -> bool:
+    cleaned: Dict[str, Dict[str, Any]] = {}
+    for key, value in (mapping or {}).items():
+        issue_key = _normalize_issue_key(key)
+        if not issue_key:
+            continue
+        label = ""
+        active = True
+        statuses: List[str] = []
+        keywords: List[str] = []
+        instructions = ""
+        if isinstance(value, dict):
+            label = str(value.get("label") or "").strip()
+            active = value.get("active")
+            statuses = _sanitize_issue_statuses(value.get("statuses"))
+            keywords = _sanitize_issue_keywords(value.get("keywords"))
+            instructions = _sanitize_issue_instructions(value.get("instructions"))
+        elif value is not None:
+            label = str(value).strip()
+        cleaned[issue_key] = {
+            "label": label or _issue_label_from_key(issue_key),
+            "active": True if active is None else bool(active),
+            "statuses": statuses,
+            "keywords": keywords,
+            "instructions": instructions,
+        }
+    try:
+        ISSUE_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ordered = dict(sorted(cleaned.items(), key=lambda item: item[0]))
+        ISSUE_CONFIG_PATH.write_text(_json_dumps(ordered, pretty=True), encoding="utf-8")
+        return True
+    except Exception as exc:
+        log.warning("Failed to save issue config to %s: %s", ISSUE_CONFIG_PATH, exc)
+        return False
+
+ISSUE_TYPES_CONFIG = _load_issue_config()
+
+def _issue_type_label(issue_type: Optional[str]) -> str:
+    if not issue_type:
+        return "issue"
+    cleaned = _normalize_issue_key(issue_type)
+    if not cleaned:
+        return "issue"
+    config = ISSUE_TYPES_CONFIG.get(cleaned)
+    if config and config.get("label"):
+        return str(config.get("label"))
+    if cleaned in ISSUE_TYPE_LABELS:
+        return ISSUE_TYPE_LABELS[cleaned]
+    return _issue_label_from_key(cleaned)
+
+
+def _format_admin_ticket_datetime(value: Optional[Any]) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    formatted = _format_timestamp_value(value)
+    if formatted:
+        return formatted
+    try:
+        return str(value)
+    except Exception:
+        return ""
+
+
+def get_ticket_issue_type_options(*, active_only: bool = True) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    for key, payload in ISSUE_TYPES_CONFIG.items():
+        label = (payload or {}).get("label") if isinstance(payload, dict) else None
+        active = True
+        statuses: List[str] = []
+        if isinstance(payload, dict):
+            active = payload.get("active")
+            statuses = _sanitize_issue_statuses(payload.get("statuses"))
+        entry = {
+            "value": key,
+            "label": (label or _issue_label_from_key(key)),
+            "active": True if active is None else bool(active),
+            "statuses": statuses,
+        }
+        if active_only and not entry["active"]:
+            continue
+        entries.append(entry)
+    entries.sort(key=lambda item: str(item.get("label") or item.get("value") or ""))
+    return entries
+
+
+def _admin_create_ticket_with_templates(
+    *,
+    admin_user: Dict[str, Any],
+    wa_id: str,
+    issue_type: str,
+    initial_message: str,
+    status: str,
+    location_desc: Optional[str] = None,
+    wa_template_id: Optional[str] = None,
+    email_template_id: Optional[str] = None,
+    send_wa: bool = False,
+    send_email: bool = False,
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "ticket_id": None,
+        "wa_sent": False,
+        "email_sent": False,
+        "wa_error": None,
+        "email_error": None,
+    }
+    wa_id_normalized = _normalize_wa_id(wa_id) or wa_id
+    issue_value = _normalize_issue_key(issue_type)
+    status_value = (status or "collecting").strip().lower() or "collecting"
+    location_value = (location_desc or "").strip() or None
+    template_value = (wa_template_id or "").strip()
+    email_template_value = (email_template_id or "").strip()
+
+    driver_profile, _ = fetch_driver_profile(wa_id_normalized)
+    ticket_id = create_driver_issue_ticket(
+        wa_id_normalized,
+        initial_message,
+        driver_profile or {},
+        issue_type=issue_value,
+        status=status_value,
+        location_desc=location_value,
+        metadata_extra={
+            "admin_template_id": template_value,
+            "admin_email_template_id": email_template_value,
+        }
+        if (template_value or email_template_value)
+        else None,
+    )
+    result["ticket_id"] = ticket_id
+    if not ticket_id:
+        result["wa_error"] = "ticket_create_failed"
+        result["email_error"] = "ticket_create_failed"
+        return result
+
+    if send_wa:
+        if template_value:
+            templates_map = {t.get("id"): t for t in get_whatsapp_templates() if t.get("id")}
+            template_def = templates_map.get(template_value)
+            if template_def:
+                params_payload = _build_admin_ticket_template_params(
+                    template_def,
+                    driver_profile or {},
+                    initial_message,
+                    ticket_id,
+                )
+                outbound_id = None
+                if params_payload:
+                    outbound_id = send_whatsapp_template(
+                        wa_id_normalized,
+                        template_value,
+                        template_def.get("language") or "en",
+                        params_payload,
+                        None,
+                        param_names=template_def.get("variables"),
+                        parameter_format=template_def.get("parameter_format"),
+                    )
+                metadata_patch: Dict[str, Any] = {
+                    "wa_template_sent": bool(outbound_id),
+                    "wa_template_id": template_value,
+                    "wa_template_params": params_payload,
+                }
+                if outbound_id:
+                    metadata_patch["wa_template_message_id"] = outbound_id
+                    _record_outbound_template_context(
+                        wa_id_normalized,
+                        template_value,
+                        params_payload,
+                        param_names=template_def.get("variables"),
+                        parameter_format=template_def.get("parameter_format"),
+                    )
+                    result["wa_sent"] = True
+                else:
+                    metadata_patch["wa_template_error"] = "send_failed"
+                    result["wa_error"] = "send_failed"
+                update_driver_issue_metadata(ticket_id, metadata_patch)
+            else:
+                result["wa_error"] = "template_not_found"
+                update_driver_issue_metadata(ticket_id, {"wa_template_error": "template_not_found"})
+        else:
+            result["wa_error"] = "template_missing"
+            update_driver_issue_metadata(ticket_id, {"wa_template_error": "template_missing"})
+
+    if send_email:
+        if not email_template_value:
+            result["email_error"] = "template_missing"
+            log_driver_issue_ticket_event(
+                ticket_id,
+                admin_email=admin_user.get("email"),
+                action_type="email_send_failed",
+                note="Email template missing for bulk import.",
+            )
+        else:
+            recipient = (driver_profile or {}).get("email")
+            template_record = None
+            try:
+                template_record = get_email_template_by_id(int(email_template_value))
+            except Exception:
+                template_record = None
+            if not recipient:
+                result["email_error"] = "recipient_missing"
+                log_driver_issue_ticket_event(
+                    ticket_id,
+                    admin_email=admin_user.get("email"),
+                    action_type="email_send_failed",
+                    note="Driver email not found.",
+                )
+            elif not template_record or not template_record.get("is_active"):
+                result["email_error"] = "template_not_found"
+                log_driver_issue_ticket_event(
+                    ticket_id,
+                    admin_email=admin_user.get("email"),
+                    action_type="email_send_failed",
+                    note="Email template not found or inactive.",
+                )
+            else:
+                context = _build_email_template_context(
+                    {"id": ticket_id, "issue_type": issue_value, "status": status_value},
+                    driver_profile or {},
+                    initial_message,
+                )
+                subject = _render_email_template(template_record.get("subject_template") or "", context)
+                body = _render_email_template(template_record.get("body_template") or "", context)
+                sent_ok, message_id, thread_id = send_email_message(recipient, subject, body)
+                status_label = "sent" if sent_ok else "send_failed"
+                log_email_event(
+                    direction="OUTBOUND",
+                    email_address=recipient,
+                    subject=subject,
+                    body=body,
+                    status=status_label,
+                    wa_id=wa_id_normalized,
+                    ticket_id=ticket_id,
+                    admin_email=admin_user.get("email"),
+                    message_id=message_id,
+                    thread_id=thread_id,
+                    raw_json={"template_id": template_record.get("id"), "template_name": template_record.get("name")},
+                )
+                update_driver_issue_metadata(
+                    ticket_id,
+                    {
+                        "email_template_id": template_record.get("id"),
+                        "email_template_name": template_record.get("name"),
+                        "email_recipient": recipient,
+                        "email_status": status_label,
+                        "email_subject": subject,
+                    },
+                )
+                log_driver_issue_ticket_event(
+                    ticket_id,
+                    admin_email=admin_user.get("email"),
+                    action_type="email_sent" if sent_ok else "email_send_failed",
+                    note=f"Recipient: {recipient} | Template: {template_record.get('name')}",
+                )
+                result["email_sent"] = bool(sent_ok)
+                if not sent_ok:
+                    result["email_error"] = "send_failed"
+
+    return result
+
+def _format_ticket_reference(ticket_id: Optional[int], issue_type: Optional[str]) -> str:
+    if not ticket_id:
+        return ""
+    label = _issue_type_label(issue_type)
+    return f"Ref: Ticket {ticket_id} ({label})."
+
+def _format_ticket_reference_list(items: List[Tuple[Optional[int], Optional[str]]]) -> str:
+    refs: List[str] = []
+    for ticket_id, issue_type in items:
+        if not ticket_id:
+            continue
+        label = _issue_type_label(issue_type)
+        refs.append(f"Ticket {ticket_id} ({label})")
+    if not refs:
+        return ""
+    if len(refs) == 1:
+        return f"Ref: {refs[0]}."
+    return "Refs: " + "; ".join(refs) + "."
+
+def _append_ticket_reference(body: str, ticket_id: Optional[int], issue_type: Optional[str]) -> str:
+    ref = _format_ticket_reference(ticket_id, issue_type)
+    if not ref:
+        return body
+    if not body:
+        return ref
+    joiner = " " if body.rstrip().endswith((".", "!", "?")) else ". "
+    return f"{body.rstrip()}{joiner}{ref}"
+
+def _append_ticket_reference_list(body: str, items: List[Tuple[Optional[int], Optional[str]]]) -> str:
+    ref = _format_ticket_reference_list(items)
+    if not ref:
+        return body
+    if not body:
+        return ref
+    joiner = " " if body.rstrip().endswith((".", "!", "?")) else ". "
+    return f"{body.rstrip()}{joiner}{ref}"
+
 def _build_ticket_closed_message(ticket: Dict[str, Any], reason: Optional[str]) -> str:
     issue_type = (ticket.get("issue_type") or "").strip().lower()
     reason_clean = (reason or "").strip()
@@ -1500,6 +3683,17 @@ def _normalize_email(value: Optional[str]) -> Optional[str]:
         return None
     cleaned = value.strip().lower()
     return cleaned or None
+
+
+def _normalize_phone_digits(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    digits = re.sub(r"\D", "", str(value))
+    if not digits:
+        return None
+    if len(digits) == 10 and digits.startswith("0"):
+        digits = f"27{digits[1:]}"
+    return digits
 
 
 def _admin_manage_flag_available() -> bool:
@@ -1746,49 +3940,183 @@ def get_whatsapp_templates() -> List[Dict[str, Any]]:
     return APPROVED_WA_TEMPLATES
 
 
+def _current_whatsapp_registry_ts() -> str:
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def _normalize_whatsapp_template_id(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    cleaned = re.sub(r"[^a-z0-9_-]+", "_", str(value).strip().lower())
+    if not cleaned:
+        return None
+    return cleaned.strip("_")
+
+
+def _normalize_whatsapp_template_status(value: Optional[str]) -> str:
+    candidate = str(value or "").strip().lower()
+    if candidate in WHATSAPP_TEMPLATE_STATUSES:
+        return candidate
+    return "pending"
+
+
+def _parse_whatsapp_variables(raw: Optional[str]) -> List[str]:
+    if not raw:
+        return []
+    tokens = re.split(r"[\s,;]+", str(raw))
+    cleaned = [token.strip() for token in tokens if token and token.strip()]
+    return cleaned
+
+
+def _build_whatsapp_meta(payload: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    meta: Dict[str, str] = {}
+    if not payload:
+        return meta
+    for key in WHATSAPP_TEMPLATE_META_KEYS:
+        value = payload.get(key)
+        if value is None:
+            continue
+        trimmed = str(value).strip()
+        if trimmed:
+            meta[key] = trimmed
+    return meta
+
+
+def load_whatsapp_template_registry() -> List[Dict[str, Any]]:
+    if not WHATSAPP_TEMPLATE_REGISTRY_PATH.exists():
+        return []
+    try:
+        payload = json.loads(WHATSAPP_TEMPLATE_REGISTRY_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.debug("Failed to read WhatsApp template registry: %s", exc)
+        return []
+    if isinstance(payload, list):
+        return [entry for entry in payload if isinstance(entry, dict)]
+    return []
+
+
+def save_whatsapp_template_registry(records: List[Dict[str, Any]]) -> bool:
+    try:
+        WHATSAPP_TEMPLATE_REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        WHATSAPP_TEMPLATE_REGISTRY_PATH.write_text(_json_dumps(records, pretty=True), encoding="utf-8")
+        return True
+    except Exception as exc:
+        log.error("Failed to save WhatsApp template registry: %s", exc)
+        return False
+
+
+def register_whatsapp_template(
+    *,
+    admin_email: str,
+    template_id: str,
+    name: Optional[str],
+    description: Optional[str],
+    language: Optional[str],
+    variables: List[str],
+    sample: Optional[str],
+    notes: Optional[str],
+    meta: Optional[Dict[str, Any]] = None,
+) -> Tuple[bool, str]:
+    normalized_id = _normalize_whatsapp_template_id(template_id)
+    if not normalized_id:
+        return False, "invalid"
+    registry = load_whatsapp_template_registry()
+    existing_idx = next((idx for idx, entry in enumerate(registry) if entry.get("id") == normalized_id), None)
+    now = _current_whatsapp_registry_ts()
+    created_at = now
+    registered_by = admin_email
+    status = "pending"
+    if existing_idx is not None:
+        existing = registry[existing_idx]
+        created_at = existing.get("created_at") or now
+        registered_by = existing.get("registered_by") or admin_email
+        status = _normalize_whatsapp_template_status(existing.get("status"))
+    sanitized_meta = _build_whatsapp_meta(meta or {})
+    record: Dict[str, Any] = {
+        "id": normalized_id,
+        "name": str(name or normalized_id).strip(),
+        "description": str(description or "").strip(),
+        "language": (str(language or "en").strip() or "en"),
+        "variables": [v for v in variables if v],
+        "sample": str(sample or "").strip(),
+        "notes": str(notes or "").strip(),
+        "meta": sanitized_meta,
+        "status": status,
+        "registered_by": registered_by,
+        "updated_by": admin_email,
+        "created_at": created_at,
+        "updated_at": now,
+        "source": "manual",
+    }
+    if existing_idx is not None:
+        registry[existing_idx] = record
+        outcome = "updated"
+    else:
+        registry.append(record)
+        outcome = "created"
+    ok = save_whatsapp_template_registry(registry)
+    return (ok, outcome if ok else "save_error")
+
+
+def update_whatsapp_template_status_record(
+    *,
+    template_id: str,
+    status: Optional[str],
+    admin_email: str,
+    notes: Optional[str],
+) -> Tuple[bool, str]:
+    normalized_id = _normalize_whatsapp_template_id(template_id)
+    if not normalized_id:
+        return False, "invalid"
+    registry = load_whatsapp_template_registry()
+    entry_idx = next((idx for idx, entry in enumerate(registry) if entry.get("id") == normalized_id), None)
+    if entry_idx is None:
+        return False, "not_found"
+    entry = registry[entry_idx]
+    entry["status"] = _normalize_whatsapp_template_status(status)
+    entry["notes"] = str(notes or "").strip()
+    entry["updated_at"] = _current_whatsapp_registry_ts()
+    entry["updated_by"] = admin_email
+    registry[entry_idx] = entry
+    ok = save_whatsapp_template_registry(registry)
+    return (ok, "status_updated" if ok else "save_error")
+
+
+def _collect_whatsapp_meta_from_form(form: Any) -> Dict[str, str]:
+    meta: Dict[str, str] = {}
+    for key, _label in WHATSAPP_TEMPLATE_META_FIELDS:
+        raw = form.get(f"meta_{key}")
+        if raw is None:
+            continue
+        trimmed = str(raw).strip()
+        if not trimmed:
+            continue
+        meta[key] = trimmed
+    return meta
+
+
 def email_delivery_available() -> bool:
-    return bool(SMTP_HOST and SMTP_USERNAME and SMTP_PASSWORD)
+    return bool(_gmail_configured() or (SMTP_HOST and SMTP_USERNAME and SMTP_PASSWORD))
 
 
 def send_password_reset_email(recipient: str, reset_link: str) -> bool:
     if not email_delivery_available():
         log.warning(
-            "Password reset email not sent (SMTP not configured) for %s. Link=%s",
+            "Password reset email not sent (email not configured) for %s. Link=%s",
             recipient,
             reset_link,
         )
         return False
-    try:
-        import smtplib
-        from email.message import EmailMessage
-
-        msg = EmailMessage()
-        msg["Subject"] = "Dineo Ops Portal password reset"
-        msg["From"] = SMTP_USERNAME
-        msg["To"] = recipient
-        msg.set_content(
-            f"Hi,\n\nUse the link below to reset your Dineo Ops Portal password. "
-            f"The link expires in {RESET_TOKEN_MAX_AGE // 60} minutes.\n\n{reset_link}\n\n"
-            "If you didn’t request this, you can ignore the email.\n"
-        )
-
-        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
-        try:
-            if SMTP_USE_TLS:
-                server.starttls()
-            if SMTP_USERNAME and SMTP_PASSWORD:
-                server.login(SMTP_USERNAME, SMTP_PASSWORD)
-            server.send_message(msg)
-        finally:
-            try:
-                server.quit()
-            except Exception:
-                pass
-        return True
-    except Exception as exc:
-        log.error("Failed to send password reset email to %s: %s", recipient, exc)
+    body = (
+        "Hi,\n\n"
+        "Use the link below to reset your Dineo Ops Portal password. "
+        f"The link expires in {RESET_TOKEN_MAX_AGE // 60} minutes.\n\n{reset_link}\n\n"
+        "If you didn’t request this, you can ignore the email.\n"
+    )
+    ok, _, _ = send_email_message(recipient, "Dineo Ops Portal password reset", body)
+    if not ok:
         log.info("Reset link for troubleshooting: %s", reset_link)
-        return False
+    return ok
 
 
 def create_password_reset_token(admin_id: int, email: str) -> str:
@@ -1849,9 +4177,210 @@ def get_authenticated_admin(request: Request) -> Optional[Dict[str, Any]]:
     return user
 
 
-def send_generic_email(recipient: str, subject: str, body: str) -> bool:
-    if not email_delivery_available():
-        log.warning("Email not sent (SMTP not configured) for %s. Subject=%s", recipient, subject)
+def _gmail_oauth_token_path() -> Optional[Path]:
+    client_path = (GMAIL_OAUTH_CLIENT_FILE or "").strip()
+    token_path = (GMAIL_OAUTH_TOKEN_FILE or "").strip()
+    if token_path:
+        try:
+            return Path(token_path).expanduser()
+        except Exception:
+            return None
+    if not client_path:
+        return None
+    try:
+        return Path(client_path).expanduser().with_name("token.json")
+    except Exception:
+        return None
+
+
+def _build_gmail_oauth_service(scopes: List[str]):
+    client_path = (GMAIL_OAUTH_CLIENT_FILE or "").strip()
+    if not client_path:
+        return None
+    token_path = _gmail_oauth_token_path()
+    if not token_path:
+        return None
+    try:
+        client_file = Path(client_path).expanduser()
+        if not client_file.exists() or not token_path.exists():
+            return None
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+        from googleapiclient.discovery import build
+
+        creds = Credentials.from_authorized_user_file(str(token_path), scopes=scopes)
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            try:
+                token_path.write_text(creds.to_json(), encoding="utf-8")
+            except Exception:
+                pass
+        if not creds or not creds.valid:
+            return None
+        return build("gmail", "v1", credentials=creds, cache_discovery=False)
+    except Exception as exc:
+        log.warning("Failed to initialize Gmail OAuth service: %s", exc)
+        return None
+
+
+def _build_gmail_service(scopes: List[str]):
+    oauth_service = _build_gmail_oauth_service(scopes)
+    if oauth_service:
+        return oauth_service
+    key_path = (GMAIL_SERVICE_ACCOUNT_FILE or "").strip()
+    delegated = (GMAIL_DELEGATED_USER or "").strip()
+    if not (key_path and delegated):
+        return None
+    try:
+        key_file = Path(key_path).expanduser()
+        if not key_file.exists():
+            return None
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+
+        creds = service_account.Credentials.from_service_account_file(
+            str(key_file),
+            scopes=scopes,
+        )
+        creds = creds.with_subject(delegated)
+        return build("gmail", "v1", credentials=creds, cache_discovery=False)
+    except Exception as exc:
+        log.warning("Failed to initialize Gmail service: %s", exc)
+        return None
+
+
+_inline_image_map_cache: Optional[Dict[str, Path]] = None
+_inline_image_map_raw_cache: Optional[str] = None
+
+def _parse_inline_image_map(raw: str) -> Dict[str, Path]:
+    mapping: Dict[str, Path] = {}
+    for part in re.split(r"[;,]", raw or ""):
+        entry = (part or "").strip()
+        if not entry or "=" not in entry:
+            continue
+        key, value = entry.split("=", 1)
+        cid = key.strip().lower()
+        if not cid:
+            continue
+        path_raw = value.strip().strip('"').strip("'")
+        if not path_raw:
+            continue
+        path = Path(path_raw).expanduser()
+        if not path.is_absolute():
+            path = BASE_DIR / path
+        mapping[cid] = path
+    return mapping
+
+def _get_inline_image_map() -> Dict[str, Path]:
+    global _inline_image_map_cache, _inline_image_map_raw_cache
+    raw = EMAIL_INLINE_IMAGE_MAP_RAW or ""
+    if _inline_image_map_cache is None or raw != _inline_image_map_raw_cache:
+        _inline_image_map_cache = _parse_inline_image_map(raw)
+        _inline_image_map_raw_cache = raw
+    return _inline_image_map_cache or {}
+
+def _extract_cid_refs(html: str) -> List[str]:
+    if not html:
+        return []
+    refs = {m.group(1) for m in re.finditer(r"cid:([a-z0-9._-]+)", html, flags=re.IGNORECASE)}
+    return sorted(refs)
+
+def _collect_inline_images(html: str) -> Dict[str, Tuple[bytes, str, str]]:
+    inline_map = _get_inline_image_map()
+    if not inline_map:
+        return {}
+    cids = _extract_cid_refs(html)
+    if not cids:
+        return {}
+    collected: Dict[str, Tuple[bytes, str, str]] = {}
+    for cid in cids:
+        path = inline_map.get(cid.lower())
+        if not path:
+            continue
+        try:
+            data = path.read_bytes()
+        except Exception as exc:
+            log.warning("Failed to read inline image %s at %s: %s", cid, path, exc)
+            continue
+        mime_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+        if "/" in mime_type:
+            maintype, subtype = mime_type.split("/", 1)
+        else:
+            maintype, subtype = "application", "octet-stream"
+        collected[cid] = (data, maintype, subtype)
+    return collected
+
+def _looks_like_html(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    return bool(re.search(r"</?[a-z][\s\S]*?>", text, flags=re.IGNORECASE))
+
+def _set_email_message_content(
+    msg,
+    body: str,
+    *,
+    is_html: bool,
+    inline_images: Optional[Dict[str, Tuple[bytes, str, str]]] = None,
+) -> None:
+    if is_html:
+        fallback = _strip_html(body or "")
+        msg.set_content((fallback or "").strip() or " ")
+        msg.add_alternative(body or "", subtype="html")
+        if inline_images:
+            html_part = None
+            for part in msg.iter_parts():
+                if part.get_content_type() == "text/html":
+                    html_part = part
+                    break
+            if html_part:
+                for cid, (data, maintype, subtype) in inline_images.items():
+                    html_part.add_related(data, maintype=maintype, subtype=subtype, cid=cid)
+    else:
+        msg.set_content(body or "")
+
+def _send_gmail_api_email(
+    recipient: str,
+    subject: str,
+    body: str,
+    *,
+    sender: Optional[str] = None,
+    thread_id: Optional[str] = None,
+    is_html: bool = False,
+    inline_images: Optional[Dict[str, Tuple[bytes, str, str]]] = None,
+) -> Tuple[bool, Optional[str], Optional[str]]:
+    service = _build_gmail_service(["https://www.googleapis.com/auth/gmail.send"])
+    if not service:
+        return False, None, None
+    try:
+        import base64
+        from email.message import EmailMessage
+
+        msg = EmailMessage()
+        if sender:
+            msg["From"] = sender
+        msg["To"] = recipient
+        msg["Subject"] = subject or ""
+        _set_email_message_content(msg, body or "", is_html=is_html, inline_images=inline_images)
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+        payload: Dict[str, Any] = {"raw": raw}
+        if thread_id:
+            payload["threadId"] = thread_id
+        sent = service.users().messages().send(userId="me", body=payload).execute()
+        return True, sent.get("id"), sent.get("threadId")
+    except Exception as exc:
+        log.error("Gmail API send failed to %s: %s", recipient, exc)
+        return False, None, None
+
+
+def _send_smtp_email(
+    recipient: str,
+    subject: str,
+    body: str,
+    *,
+    is_html: bool = False,
+    inline_images: Optional[Dict[str, Tuple[bytes, str, str]]] = None,
+) -> bool:
+    if not (SMTP_HOST and SMTP_USERNAME and SMTP_PASSWORD):
         return False
     try:
         import smtplib
@@ -1861,14 +4390,13 @@ def send_generic_email(recipient: str, subject: str, body: str) -> bool:
         msg["Subject"] = subject
         msg["From"] = SMTP_USERNAME
         msg["To"] = recipient
-        msg.set_content(body or "")
+        _set_email_message_content(msg, body or "", is_html=is_html, inline_images=inline_images)
 
         server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
         try:
             if SMTP_USE_TLS:
                 server.starttls()
-            if SMTP_USERNAME and SMTP_PASSWORD:
-                server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
             server.send_message(msg)
         finally:
             try:
@@ -1879,6 +4407,41 @@ def send_generic_email(recipient: str, subject: str, body: str) -> bool:
     except Exception as exc:
         log.error("Failed to send email to %s: %s", recipient, exc)
         return False
+
+
+def send_email_message(
+    recipient: str,
+    subject: str,
+    body: str,
+    *,
+    is_html: Optional[bool] = None,
+) -> Tuple[bool, Optional[str], Optional[str]]:
+    html_flag = _looks_like_html(body) if is_html is None else bool(is_html)
+    inline_images = _collect_inline_images(body) if html_flag else {}
+    if _gmail_configured():
+        sender = (GMAIL_DELEGATED_USER or SMTP_USERNAME or "").strip() or None
+        ok, message_id, thread_id = _send_gmail_api_email(
+            recipient,
+            subject,
+            body,
+            sender=sender,
+            is_html=html_flag,
+            inline_images=inline_images,
+        )
+        if ok:
+            return ok, message_id, thread_id
+        if not (SMTP_HOST and SMTP_USERNAME and SMTP_PASSWORD):
+            return False, None, None
+    ok = _send_smtp_email(recipient, subject, body, is_html=html_flag, inline_images=inline_images)
+    return ok, None, None
+
+
+def send_generic_email(recipient: str, subject: str, body: str) -> bool:
+    if not email_delivery_available():
+        log.warning("Email not sent (email not configured) for %s. Subject=%s", recipient, subject)
+        return False
+    ok, _, _ = send_email_message(recipient, subject, body)
+    return ok
 
 
 def _ensure_interaction_table():
@@ -1918,6 +4481,308 @@ def _ensure_interaction_table():
                 cur.execute(f"ALTER TABLE {INTERACTION_TABLE} ADD COLUMN ptp_payment DECIMAL(18,2) NULL AFTER ptp_date")
     except Exception as exc:
         log.debug("Could not ensure interaction table: %s", exc)
+
+
+def _ensure_email_tables() -> None:
+    if not mysql_available():
+        return
+    try:
+        conn = get_mysql()
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {EMAIL_TEMPLATE_TABLE} (
+                    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                    name VARCHAR(128) NOT NULL,
+                    subject_template VARCHAR(255) NULL,
+                    body_template LONGTEXT NULL,
+                    is_active TINYINT(1) NOT NULL DEFAULT 1,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (id),
+                    KEY idx_email_template_active (is_active),
+                    KEY idx_email_template_updated (updated_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+    except Exception as exc:
+        log.debug("Could not ensure email template table: %s", exc)
+
+
+def _ensure_email_logs_table() -> None:
+    if not mysql_available():
+        return
+    try:
+        conn = get_mysql()
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {EMAIL_LOG_TABLE} (
+                    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                    direction VARCHAR(16) NOT NULL,
+                    email_address VARCHAR(255) NULL,
+                    subject VARCHAR(255) NULL,
+                    body LONGTEXT NULL,
+                    status VARCHAR(32) NULL,
+                    wa_id VARCHAR(32) NULL,
+                    ticket_id BIGINT UNSIGNED NULL,
+                    admin_email VARCHAR(255) NULL,
+                    message_id VARCHAR(255) NULL,
+                    thread_id VARCHAR(255) NULL,
+                    raw_json JSON NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (id),
+                    UNIQUE KEY uniq_email_message (message_id),
+                    KEY idx_email_logs_direction (direction),
+                    KEY idx_email_logs_email (email_address),
+                    KEY idx_email_logs_created (created_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+    except Exception as exc:
+        log.debug("Could not ensure email log table: %s", exc)
+
+
+def get_email_templates(*, active_only: bool = False) -> List[Dict[str, Any]]:
+    if not mysql_available():
+        return []
+    _ensure_email_tables()
+    try:
+        conn = get_mysql()
+        with conn.cursor() as cur:
+            where = "WHERE is_active=1" if active_only else ""
+            cur.execute(
+                f"""
+                SELECT id, name, subject_template, body_template, is_active, created_at, updated_at
+                FROM {EMAIL_TEMPLATE_TABLE}
+                {where}
+                ORDER BY updated_at DESC, id DESC
+                """
+            )
+            rows = cur.fetchall() or []
+        return rows
+    except Exception as exc:
+        log.debug("get_email_templates failed: %s", exc)
+        return []
+
+
+def get_email_template_by_id(template_id: int) -> Optional[Dict[str, Any]]:
+    if not mysql_available():
+        return None
+    _ensure_email_tables()
+    try:
+        conn = get_mysql()
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, name, subject_template, body_template, is_active, created_at, updated_at
+                FROM {EMAIL_TEMPLATE_TABLE}
+                WHERE id=%s
+                LIMIT 1
+                """,
+                (int(template_id),),
+            )
+            return cur.fetchone()
+    except Exception as exc:
+        log.debug("get_email_template_by_id failed: %s", exc)
+        return None
+
+
+def _render_email_template(text: str, context: Dict[str, Any]) -> str:
+    if not text:
+        return ""
+    try:
+        return templates.env.from_string(text).render(**(context or {})).strip()
+    except Exception as exc:
+        log.debug("email template render failed: %s", exc)
+        return text
+
+
+def _build_email_template_context(
+    ticket: Dict[str, Any],
+    profile: Optional[Dict[str, Any]],
+    initial_message: Optional[str] = None,
+) -> Dict[str, Any]:
+    profile = profile or {}
+    ticket_id = ticket.get("id")
+    issue_type = _issue_type_label(ticket.get("issue_type"))
+    status = (ticket.get("status") or "").replace("_", " ").title()
+    amount_text = _admin_ticket_template_amount(initial_message or "", profile)
+    display_name = _admin_ticket_display_name(profile)
+    return {
+        "name": display_name,
+        "ticket_id": ticket_id,
+        "issue_type": issue_type,
+        "status": status,
+        "amount": amount_text,
+        "reference": f"Ticket #{ticket_id}" if ticket_id else "",
+        "today": fmt_jhb_date(),
+        "time": fmt_jhb_time(),
+    }
+
+
+def log_email_event(
+    *,
+    direction: str,
+    email_address: Optional[str],
+    subject: Optional[str],
+    body: Optional[str],
+    status: Optional[str],
+    wa_id: Optional[str] = None,
+    ticket_id: Optional[int] = None,
+    admin_email: Optional[str] = None,
+    message_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
+    raw_json: Optional[Dict[str, Any]] = None,
+    created_at: Optional[datetime] = None,
+) -> None:
+    if not mysql_available():
+        return
+    _ensure_email_logs_table()
+    try:
+        conn = get_mysql()
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO {EMAIL_LOG_TABLE}
+                  (direction, email_address, subject, body, status, wa_id, ticket_id,
+                   admin_email, message_id, thread_id, raw_json, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    (direction or "").upper(),
+                    email_address,
+                    subject,
+                    body,
+                    status,
+                    wa_id,
+                    ticket_id,
+                    admin_email,
+                    message_id,
+                    thread_id,
+                    json.dumps(raw_json, ensure_ascii=False) if raw_json else None,
+                    created_at or datetime.utcnow(),
+                ),
+            )
+    except Exception as exc:
+        log.debug("log_email_event failed: %s", exc)
+
+
+def create_email_template(name: str, subject: str, body: str) -> Tuple[bool, str]:
+    if not mysql_available():
+        return False, "Database unavailable."
+    clean_name = (name or "").strip()
+    clean_subject = (subject or "").strip()
+    clean_body = (body or "").strip()
+    if not clean_name or not clean_subject or not clean_body:
+        return False, "Name, subject, and body are required."
+    _ensure_email_tables()
+    try:
+        conn = get_mysql()
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO {EMAIL_TEMPLATE_TABLE} (name, subject_template, body_template, is_active)
+                VALUES (%s, %s, %s, 1)
+                """,
+                (clean_name, clean_subject, clean_body),
+            )
+        return True, ""
+    except Exception as exc:
+        log.error("create_email_template failed: %s", exc)
+        return False, "Could not save template."
+
+
+def update_email_template(template_id: int, name: str, subject: str, body: str) -> Tuple[bool, str]:
+    if not mysql_available():
+        return False, "Database unavailable."
+    clean_name = (name or "").strip()
+    clean_subject = (subject or "").strip()
+    clean_body = (body or "").strip()
+    if not clean_name or not clean_subject or not clean_body:
+        return False, "Name, subject, and body are required."
+    _ensure_email_tables()
+    try:
+        conn = get_mysql()
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE {EMAIL_TEMPLATE_TABLE}
+                SET name=%s, subject_template=%s, body_template=%s, updated_at=CURRENT_TIMESTAMP
+                WHERE id=%s
+                """,
+                (clean_name, clean_subject, clean_body, int(template_id)),
+            )
+        return True, ""
+    except Exception as exc:
+        log.error("update_email_template failed: %s", exc)
+        return False, "Could not update template."
+
+
+def toggle_email_template(template_id: int, active: bool) -> Tuple[bool, str]:
+    if not mysql_available():
+        return False, "Database unavailable."
+    _ensure_email_tables()
+    try:
+        conn = get_mysql()
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE {EMAIL_TEMPLATE_TABLE} SET is_active=%s WHERE id=%s",
+                (1 if active else 0, int(template_id)),
+            )
+        return True, ""
+    except Exception as exc:
+        log.error("toggle_email_template failed: %s", exc)
+        return False, "Could not update template."
+
+
+def _parse_ptp_date(value: Optional[str]) -> Optional[date]:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value.strip(), "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def _is_public_holiday_date(value: Optional[date]) -> bool:
+    if not value:
+        return False
+    return value in PAYMENT_PUBLIC_HOLIDAYS
+
+
+def _ptp_grace_hours(due_date: Optional[date]) -> int:
+    if _is_public_holiday_date(due_date):
+        return 48
+    if due_date and due_date.weekday() == 5:  # Saturday
+        return 48
+    return 24
+
+
+def _determine_ptp_status(
+    amount: Optional[float],
+    payment: Optional[float],
+    due_date: Optional[date],
+    reference: datetime,
+) -> str:
+    payment_present = payment is not None and payment > 0
+    amount_specified = amount is not None and amount > 0
+    if payment_present:
+        if amount_specified and payment >= amount:
+            return "successful"
+        if amount_specified and payment > 0:
+            return "partial"
+        return "successful"
+
+    if due_date:
+        due_dt = datetime.combine(due_date, dt_time.min).replace(tzinfo=JHB_ZONE)
+        grace = timedelta(hours=_ptp_grace_hours(due_date))
+        pending_until = due_dt + grace
+        if reference <= pending_until:
+            return "pending"
+        return "failed"
+
+    return "pending"
 
 
 def log_interaction(
@@ -2098,6 +4963,402 @@ def get_all_interactions(limit: int = 200) -> List[Dict[str, Any]]:
         return []
 
 
+def fetch_whatsapp_logs(
+    *,
+    limit: int = 200,
+    direction: Optional[str] = None,
+    wa_id: Optional[str] = None,
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+) -> List[Dict[str, Any]]:
+    if not mysql_available():
+        return []
+    limit_val = max(1, min(int(limit or 200), 500))
+    try:
+        conn = get_mysql()
+        table = _detect_logs_table(conn)
+        available = _get_table_columns(conn, table)
+        wa_col = _pick_log_column(
+            available,
+            ["wa_id", "phone", "whatsapp_number", "whatsapp", "wa_number", "phone_number", "contact_number"],
+        )
+        msg_col = _pick_log_column(available, ["message_text", "message", "text", "body"])
+        dir_col = _pick_log_column(available, ["message_direction", "direction"])
+        ts_col = _pick_log_column(available, ["timestamp", "created_at", "logged_at", "message_timestamp"])
+        status_col = _pick_log_column(available, ["status", "send_status"])
+        origin_col = _pick_log_column(available, ["origin_type", "origin", "source"])
+        msg_id_col = _pick_log_column(available, SYNONYMS["wa_message_id"] + ["message_id"])
+
+        if not (wa_col and msg_col):
+            return []
+
+        select_cols = [
+            f"{wa_col} AS wa_id",
+            f"{msg_col} AS body",
+            f"{dir_col} AS direction" if dir_col else "NULL AS direction",
+            f"{status_col} AS status" if status_col else "NULL AS status",
+            f"{origin_col} AS origin_type" if origin_col else "NULL AS origin_type",
+            f"{ts_col} AS ts" if ts_col else "NULL AS ts",
+            f"{msg_id_col} AS message_id" if msg_id_col else "NULL AS message_id",
+        ]
+
+        where_clauses = [f"{msg_col} IS NOT NULL", f"TRIM({msg_col}) <> ''"]
+        params: List[Any] = []
+
+        if direction and dir_col:
+            where_clauses.append(f"UPPER({dir_col}) = %s")
+            params.append(direction.upper())
+
+        if wa_id and wa_col:
+            variants = _wa_number_variants(wa_id) or [wa_id]
+            sanitized_expr = _sanitize_phone_expr(wa_col)
+            placeholders = ", ".join(["%s"] * len(variants))
+            where_clauses.append(f"{sanitized_expr} IN ({placeholders})")
+            params.extend(variants)
+
+        if ts_col and date_from:
+            where_clauses.append(f"DATE({ts_col}) >= %s")
+            params.append(date_from.isoformat())
+        if ts_col and date_to:
+            where_clauses.append(f"DATE({ts_col}) <= %s")
+            params.append(date_to.isoformat())
+
+        sql = f"SELECT {', '.join(select_cols)} FROM {table}"
+        if where_clauses:
+            sql += " WHERE " + " AND ".join(where_clauses)
+        if ts_col:
+            sql += f" ORDER BY {ts_col} DESC"
+        sql += " LIMIT %s"
+        params.append(limit_val)
+
+        with conn.cursor() as cur:
+            cur.execute(sql, tuple(params))
+            rows = cur.fetchall() or []
+        return rows
+    except Exception as exc:
+        log.debug("fetch_whatsapp_logs failed: %s", exc)
+        return []
+
+
+def fetch_email_logs(
+    *,
+    limit: int = 200,
+    direction: Optional[str] = None,
+    wa_id: Optional[str] = None,
+    ticket_id: Optional[int] = None,
+    email: Optional[str] = None,
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+) -> List[Dict[str, Any]]:
+    if not mysql_available():
+        return []
+    _ensure_email_logs_table()
+    limit_val = max(1, min(int(limit or 200), 500))
+    try:
+        conn = get_mysql()
+    except Exception:
+        return []
+    if not _table_exists(conn, EMAIL_LOG_TABLE):
+        return []
+
+    where_clauses: List[str] = []
+    params: List[Any] = []
+    if direction:
+        where_clauses.append("UPPER(direction) = %s")
+        params.append(direction.upper())
+    if wa_id:
+        where_clauses.append("wa_id = %s")
+        params.append(wa_id)
+    if ticket_id:
+        where_clauses.append("ticket_id = %s")
+        params.append(int(ticket_id))
+    if email:
+        where_clauses.append("LOWER(email_address) LIKE %s")
+        params.append(f"%{email.lower()}%")
+    if date_from:
+        where_clauses.append("DATE(created_at) >= %s")
+        params.append(date_from.isoformat())
+    if date_to:
+        where_clauses.append("DATE(created_at) <= %s")
+        params.append(date_to.isoformat())
+
+    sql = (
+        f"SELECT id, direction, email_address, subject, body, status, wa_id, ticket_id, admin_email, "
+        f"message_id, thread_id, created_at "
+        f"FROM {EMAIL_LOG_TABLE}"
+    )
+    if where_clauses:
+        sql += " WHERE " + " AND ".join(where_clauses)
+    sql += " ORDER BY created_at DESC LIMIT %s"
+    params.append(limit_val)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, tuple(params))
+            rows = cur.fetchall() or []
+        return rows
+    except Exception as exc:
+        log.debug("fetch_email_logs failed: %s", exc)
+        return []
+
+
+def _decode_gmail_body_data(data: Optional[str]) -> str:
+    if not data:
+        return ""
+    try:
+        import base64
+
+        return base64.urlsafe_b64decode(data.encode("utf-8")).decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _strip_html(html: str) -> str:
+    if not html:
+        return ""
+    cleaned = re.sub(r"<(script|style)[^>]*>.*?</\\1>", " ", html, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+    cleaned = re.sub(r"\\s+", " ", cleaned)
+    return cleaned.strip()
+
+
+def _extract_gmail_body(payload: Dict[str, Any]) -> str:
+    if not payload:
+        return ""
+    text_plain = None
+    text_html = None
+    queue = [payload]
+    while queue:
+        part = queue.pop(0) or {}
+        mime = (part.get("mimeType") or "").lower()
+        body_data = (part.get("body") or {}).get("data")
+        if body_data:
+            decoded = _decode_gmail_body_data(body_data)
+            if mime.startswith("text/plain") and not text_plain:
+                text_plain = decoded
+            elif mime.startswith("text/html") and not text_html:
+                text_html = decoded
+        for subpart in part.get("parts") or []:
+            queue.append(subpart)
+    if text_plain:
+        return text_plain.strip()
+    if text_html:
+        return _strip_html(text_html)
+    return ""
+
+
+def _extract_ticket_id_from_text(text: str) -> Optional[int]:
+    if not text:
+        return None
+    match = re.search(r"\bticket\s*#?\s*(\d+)\b", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except Exception:
+        return None
+
+
+def _gmail_oauth_configured() -> bool:
+    client_path = (GMAIL_OAUTH_CLIENT_FILE or "").strip()
+    if not client_path:
+        return False
+    token_path = _gmail_oauth_token_path()
+    if not token_path:
+        return False
+    try:
+        return Path(client_path).expanduser().exists() and token_path.exists()
+    except Exception:
+        return False
+
+
+def _gmail_configured() -> bool:
+    if _gmail_oauth_configured():
+        return True
+    key_path = (GMAIL_SERVICE_ACCOUNT_FILE or "").strip()
+    delegated = (GMAIL_DELEGATED_USER or "").strip()
+    if not (key_path and delegated):
+        return False
+    try:
+        return Path(key_path).expanduser().exists()
+    except Exception:
+        return False
+
+
+def sync_gmail_inbound_messages(max_results: int = 50) -> Tuple[int, int]:
+    if not (mysql_available() and _gmail_configured()):
+        log.debug("Gmail sync requested but not configured.")
+        return -1, 0
+    _ensure_email_logs_table()
+    max_results = max(1, min(int(max_results or GMAIL_SYNC_MAX_RESULTS), 200))
+
+    try:
+        from email.utils import parseaddr, parsedate_to_datetime
+    except Exception as exc:
+        log.warning("Gmail sync dependencies missing: %s", exc)
+        return -1, 0
+
+    service = _build_gmail_service(["https://www.googleapis.com/auth/gmail.readonly"])
+    if not service:
+        return -1, 0
+
+    try:
+        response = (
+            service.users()
+            .messages()
+            .list(
+                userId="me",
+                q=GMAIL_QUERY or None,
+                maxResults=max_results,
+                includeSpamTrash=GMAIL_INCLUDE_SPAM_TRASH,
+            )
+            .execute()
+        )
+    except Exception as exc:
+        log.warning("Gmail list failed: %s", exc)
+        return -1, 0
+
+    messages = response.get("messages") or []
+    if not messages:
+        return 0, 0
+
+    message_ids = [m.get("id") for m in messages if m.get("id")]
+    existing_ids: set[str] = set()
+    try:
+        conn = get_mysql()
+        if message_ids:
+            placeholders = ", ".join(["%s"] * len(message_ids))
+            sql = f"SELECT message_id FROM {EMAIL_LOG_TABLE} WHERE message_id IN ({placeholders})"
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple(message_ids))
+                rows = cur.fetchall() or []
+            existing_ids = {row.get("message_id") for row in rows if row.get("message_id")}
+    except Exception as exc:
+        log.debug("Email log dedupe lookup failed: %s", exc)
+
+    inserted = 0
+    skipped = 0
+    for msg_id in message_ids:
+        if not msg_id or msg_id in existing_ids:
+            skipped += 1
+            continue
+        try:
+            msg = (
+                service.users()
+                .messages()
+                .get(userId="me", id=msg_id, format="full")
+                .execute()
+            )
+        except Exception as exc:
+            log.debug("Gmail fetch failed for %s: %s", msg_id, exc)
+            continue
+
+        payload = msg.get("payload") or {}
+        headers = payload.get("headers") or []
+        header_map = {str(h.get("name") or "").lower(): h.get("value") or "" for h in headers}
+        subject = header_map.get("subject", "").strip()
+        from_header = header_map.get("from", "").strip()
+        from_email = parseaddr(from_header)[1] or from_header
+        date_header = header_map.get("date", "")
+        created_at = None
+        if date_header:
+            try:
+                parsed = parsedate_to_datetime(date_header)
+                if parsed and parsed.tzinfo:
+                    created_at = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+                else:
+                    created_at = parsed
+            except Exception:
+                created_at = None
+        if created_at is None:
+            created_at = datetime.utcnow()
+
+        body = _extract_gmail_body(payload)
+        if not body:
+            body = msg.get("snippet") or ""
+
+        ticket_guess = (
+            _extract_ticket_id_from_text(subject)
+            or _extract_ticket_id_from_text(body)
+            or _extract_ticket_id_from_text(msg.get("snippet") or "")
+        )
+
+        raw_json = {
+            "gmail_id": msg_id,
+            "thread_id": msg.get("threadId"),
+            "labels": msg.get("labelIds"),
+            "snippet": msg.get("snippet"),
+        }
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    INSERT INTO {EMAIL_LOG_TABLE}
+                      (direction, email_address, subject, body, status, wa_id, ticket_id,
+                       admin_email, message_id, thread_id, raw_json, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        "INBOUND",
+                        from_email or None,
+                        subject or None,
+                        body or None,
+                        "received",
+                        None,
+                        ticket_guess,
+                        None,
+                        msg_id,
+                        msg.get("threadId"),
+                        json.dumps(raw_json, ensure_ascii=False),
+                        created_at,
+                    ),
+                )
+            inserted += 1
+        except Exception as exc:
+            log.debug("Email log insert failed: %s", exc)
+            continue
+
+    return inserted, skipped
+
+
+_gmail_auto_sync_worker_started = False
+
+def _run_gmail_auto_sync_cycle() -> None:
+    if not GMAIL_AUTO_SYNC_ENABLED:
+        return
+    if not mysql_available():
+        log.debug("Skipping Gmail auto-sync: MySQL unavailable.")
+        return
+    if not _gmail_configured():
+        log.debug("Skipping Gmail auto-sync: Gmail not configured.")
+        return
+    inserted, skipped = sync_gmail_inbound_messages(max_results=GMAIL_SYNC_MAX_RESULTS)
+    if inserted >= 0:
+        log.info("Gmail auto-sync complete (inserted=%s skipped=%s).", inserted, skipped)
+    else:
+        log.warning("Gmail auto-sync failed or is not configured.")
+
+def _gmail_auto_sync_worker() -> None:
+    while True:
+        try:
+            _run_gmail_auto_sync_cycle()
+        except Exception as exc:
+            log.warning("Gmail auto-sync worker error: %s", exc)
+        time.sleep(max(60, GMAIL_AUTO_SYNC_INTERVAL_SECONDS))
+
+def _start_gmail_auto_sync_worker() -> None:
+    global _gmail_auto_sync_worker_started
+    if _gmail_auto_sync_worker_started:
+        return
+    if not GMAIL_AUTO_SYNC_ENABLED or GMAIL_AUTO_SYNC_INTERVAL_SECONDS <= 0:
+        log.info("Gmail auto-sync worker disabled by configuration.")
+        _gmail_auto_sync_worker_started = True
+        return
+    thread = threading.Thread(target=_gmail_auto_sync_worker, name="gmail-auto-sync", daemon=True)
+    thread.start()
+    _gmail_auto_sync_worker_started = True
+    log.info("Gmail auto-sync worker started (interval=%ss).", GMAIL_AUTO_SYNC_INTERVAL_SECONDS)
+
+
 ENGAGEMENT_DRIVER_TYPE_TEMPLATES = {
     "needs attention": "performance_needs_attention",
     "no trips yet": "performance_no_trips_yet",
@@ -2195,6 +5456,87 @@ def _parse_metric_percent(value: Any) -> Optional[float]:
         return None
     text = str(value).strip().replace("%", "")
     return _parse_metric_value(text)
+
+
+def _fetch_driver_registration_by_wa(wa_ids: List[str]) -> Dict[str, str]:
+    if not (mysql_available() and wa_ids):
+        return {}
+    try:
+        conn = get_mysql()
+    except Exception:
+        return {}
+    table = f"{MYSQL_DB}.driver_kpi_summary"
+    if not _table_exists(conn, table):
+        return {}
+    available = _get_table_columns(conn, table)
+    wa_col = _pick_col_exists(
+        conn,
+        table,
+        ["phone", "wa_id", "whatsapp_number", "whatsapp", "phone_number", "contact_number"],
+    )
+    date_col = _pick_col_exists(conn, table, ["report_date", "snapshot_date", "created_at", "updated_at"])
+    reg_col = _pick_col_exists(
+        conn,
+        table,
+        ["car_reg_number", "car_reg", "car_registration", "registration_number", "reg_number", "vehicle_reg", "vehicle"],
+    )
+    if not wa_col or not date_col or not reg_col:
+        return {}
+
+    wa_map: Dict[str, str] = {}
+    digits: List[str] = []
+    for wa in wa_ids:
+        normalized = _normalize_wa_id(wa) or str(wa)
+        variants = _wa_number_variants(wa) or [normalized]
+        for var in variants:
+            v_digits = re.sub(r"\D", "", str(var))
+            if not v_digits:
+                continue
+            digits.append(v_digits)
+            if v_digits not in wa_map:
+                wa_map[v_digits] = normalized
+    digits = sorted({d for d in digits if len(d) >= 7})
+    if not digits:
+        return {}
+
+    sanitized_s = _sanitize_phone_expr(f"s.{wa_col}")
+    sanitized_t = _sanitize_phone_expr(f"t.{wa_col}")
+    placeholders = ", ".join(["%s"] * len(digits))
+    inner = (
+        f"SELECT {sanitized_s} AS wa_key, MAX(s.{date_col}) AS max_dt "
+        f"FROM {table} s "
+        f"WHERE {sanitized_s} IN ({placeholders}) "
+        f"GROUP BY {sanitized_s}"
+    )
+    select_cols = [
+        f"{sanitized_t} AS wa_key",
+        f"t.{reg_col} AS reg_value",
+    ]
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT {', '.join(select_cols)}
+                FROM {table} t
+                JOIN ({inner}) latest ON {sanitized_t} = latest.wa_key AND t.{date_col} = latest.max_dt
+                """,
+                tuple(digits),
+            )
+            rows = cur.fetchall() or []
+    except Exception as exc:
+        log.debug("fetch driver registrations failed: %s", exc)
+        return {}
+
+    reg_map: Dict[str, str] = {}
+    for row in rows:
+        wa_key = re.sub(r"\D", "", str(row.get("wa_key") or ""))
+        if not wa_key:
+            continue
+        normalized = wa_map.get(wa_key) or _normalize_wa_id(wa_key) or wa_key
+        reg_val = row.get("reg_value")
+        if reg_val:
+            reg_map[normalized] = str(reg_val).strip()
+    return reg_map
 
 def _baseline_metrics_from_row(row: Dict[str, Any]) -> Dict[str, Optional[float]]:
     return {
@@ -2382,6 +5724,9 @@ def _ensure_engagement_tables() -> None:
                     sent_count INT NOT NULL DEFAULT 0,
                     failed_count INT NOT NULL DEFAULT 0,
                     skipped_count INT NOT NULL DEFAULT 0,
+                    status VARCHAR(32) NOT NULL DEFAULT 'active',
+                    status_reason VARCHAR(255) NULL,
+                    status_updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
@@ -2396,6 +5741,27 @@ def _ensure_engagement_tables() -> None:
                     "AFTER source_filename"
                 )
                 campaign_cols.add("campaign_type")
+            if "status" not in campaign_cols:
+                cur.execute(
+                    f"ALTER TABLE {ENGAGEMENT_CAMPAIGN_TABLE} "
+                    "ADD COLUMN status VARCHAR(32) NOT NULL DEFAULT 'active' "
+                    "AFTER skipped_count"
+                )
+                campaign_cols.add("status")
+            if "status_reason" not in campaign_cols:
+                cur.execute(
+                    f"ALTER TABLE {ENGAGEMENT_CAMPAIGN_TABLE} "
+                    "ADD COLUMN status_reason VARCHAR(255) NULL "
+                    "AFTER status"
+                )
+                campaign_cols.add("status_reason")
+            if "status_updated_at" not in campaign_cols:
+                cur.execute(
+                    f"ALTER TABLE {ENGAGEMENT_CAMPAIGN_TABLE} "
+                    "ADD COLUMN status_updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP "
+                    "ON UPDATE CURRENT_TIMESTAMP AFTER status_reason"
+                )
+                campaign_cols.add("status_updated_at")
             cur.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS {ENGAGEMENT_ROW_TABLE} (
@@ -2499,6 +5865,19 @@ ENGAGEMENT_CSV_FIELDS = {
     "contact_ids": ["contact_ids", "contacts"],
 }
 
+TICKET_IMPORT_MAX_ROWS = int(os.getenv("TICKET_IMPORT_MAX_ROWS", "2000"))
+TICKET_IMPORT_PREVIEW_TTL_SECONDS = int(os.getenv("TICKET_IMPORT_PREVIEW_TTL_SECONDS", str(30 * 60)))
+TICKET_IMPORT_FIELD_ALIASES = {
+    "wa_id": ["wa_id", "wa", "whatsapp", "whatsapp_number", "phone", "phone_number", "contact_number"],
+    "issue_type": ["issue_type", "issue", "category", "ticket_type", "type"],
+    "status": ["status", "ticket_status"],
+    "initial_message": ["initial_message", "message", "note", "reason", "description"],
+    "location_desc": ["location", "location_desc", "city", "area", "ops_area"],
+    "send_wa": ["send_wa", "send_whatsapp", "wa_template", "whatsapp_template", "send_template"],
+    "send_email": ["send_email", "email_template", "send_email_template", "email_send"],
+}
+_TICKET_IMPORT_PREVIEW_CACHE: Dict[str, Dict[str, Any]] = {}
+
 
 def _extract_csv_value(row: Dict[str, Any], keys: List[str]) -> Optional[str]:
     for key in keys:
@@ -2537,6 +5916,127 @@ def _parse_engagement_csv(file: UploadFile) -> Tuple[List[Dict[str, Any]], Optio
     if not rows:
         return [], "No rows found in the uploaded CSV."
     return rows, None
+
+
+def _parse_ticket_import_csv(file: UploadFile) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]], Optional[str]]:
+    try:
+        raw = file.file.read()
+    except Exception as exc:
+        return [], [], f"Failed to read upload: {exc}"
+    if not raw:
+        return [], [], "The uploaded CSV is empty."
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        try:
+            text = raw.decode("latin-1")
+        except Exception:
+            return [], [], "Could not decode CSV. Please save it as UTF-8."
+    reader = csv.reader(io.StringIO(text))
+    try:
+        header_row = next(reader)
+    except StopIteration:
+        return [], [], "The uploaded CSV is empty."
+    if not header_row:
+        return [], [], "No headers found in the uploaded CSV."
+    normalized_headers: List[str] = []
+    header_display: Dict[str, str] = {}
+    header_counts: Dict[str, int] = {}
+    for raw_header in header_row:
+        cleaned = _normalize_csv_header(raw_header)
+        if not cleaned:
+            cleaned = "column"
+        count = header_counts.get(cleaned, 0) + 1
+        header_counts[cleaned] = count
+        key = f"{cleaned}_{count}" if count > 1 else cleaned
+        normalized_headers.append(key)
+        header_display[key] = str(raw_header or key).strip() or key
+    headers = [{"value": key, "label": header_display[key]} for key in normalized_headers]
+    rows: List[Dict[str, Any]] = []
+    for idx, row in enumerate(reader, start=2):
+        if not row:
+            continue
+        mapped: Dict[str, Any] = {"row_number": idx}
+        for col_idx, key in enumerate(normalized_headers):
+            mapped[key] = row[col_idx].strip() if col_idx < len(row) and row[col_idx] is not None else ""
+        rows.append(mapped)
+        if len(rows) >= TICKET_IMPORT_MAX_ROWS:
+            break
+    if not rows:
+        return [], headers, "No rows found in the uploaded CSV."
+    return rows, headers, None
+
+
+def _guess_ticket_import_mapping(headers: List[Dict[str, str]]) -> Dict[str, str]:
+    header_values = [h.get("value") for h in headers if h.get("value")]
+    mapping: Dict[str, str] = {}
+    for field, aliases in TICKET_IMPORT_FIELD_ALIASES.items():
+        for alias in aliases:
+            candidate = _normalize_csv_header(alias)
+            if candidate in header_values:
+                mapping[field] = candidate
+                break
+    return mapping
+
+
+def _parse_yes_no_flag(value: Optional[str]) -> Optional[bool]:
+    if value is None:
+        return None
+    raw = str(value).strip().lower()
+    if not raw:
+        return None
+    truthy = {"1", "true", "yes", "y", "send", "sent", "on"}
+    falsy = {"0", "false", "no", "n", "skip", "off"}
+    if raw in truthy:
+        return True
+    if raw in falsy:
+        return False
+    return None
+
+
+def _ticket_import_value(row: Dict[str, Any], column: Optional[str]) -> Optional[str]:
+    if not row or not column:
+        return None
+    if column not in row:
+        return None
+    value = row.get(column)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text if text else None
+
+
+def _set_ticket_import_preview_cache(preview_id: str, payload: Dict[str, Any]) -> None:
+    _TICKET_IMPORT_PREVIEW_CACHE[preview_id] = {
+        **(payload or {}),
+        "created_at": time.time(),
+    }
+
+
+def _get_ticket_import_preview_cache(preview_id: str) -> Optional[Dict[str, Any]]:
+    payload = _TICKET_IMPORT_PREVIEW_CACHE.get(preview_id)
+    if not payload:
+        return None
+    created_at = payload.get("created_at")
+    try:
+        if created_at and (time.time() - float(created_at)) > TICKET_IMPORT_PREVIEW_TTL_SECONDS:
+            _TICKET_IMPORT_PREVIEW_CACHE.pop(preview_id, None)
+            return None
+    except Exception:
+        _TICKET_IMPORT_PREVIEW_CACHE.pop(preview_id, None)
+        return None
+    return payload
+
+
+def _prune_ticket_import_preview_cache() -> None:
+    now_ts = time.time()
+    for key, payload in list(_TICKET_IMPORT_PREVIEW_CACHE.items()):
+        created_at = payload.get("created_at")
+        try:
+            if created_at and (now_ts - float(created_at)) > TICKET_IMPORT_PREVIEW_TTL_SECONDS:
+                _TICKET_IMPORT_PREVIEW_CACHE.pop(key, None)
+        except Exception:
+            _TICKET_IMPORT_PREVIEW_CACHE.pop(key, None)
 
 
 def _normalize_driver_type(value: Optional[str]) -> str:
@@ -2710,8 +6210,9 @@ def _create_engagement_campaign(
             cur.execute(
                 f"""
                 INSERT INTO {ENGAGEMENT_CAMPAIGN_TABLE}
-                  (id, admin_email, source_filename, campaign_type, template_map_json, total_rows, sent_count, failed_count, skipped_count)
-                VALUES (%s, %s, %s, %s, %s, %s, 0, 0, 0)
+                  (id, admin_email, source_filename, campaign_type, template_map_json, total_rows,
+                   sent_count, failed_count, skipped_count, status, status_reason)
+                VALUES (%s, %s, %s, %s, %s, %s, 0, 0, 0, %s, %s)
                 """,
                 (
                     campaign_id,
@@ -2720,6 +6221,8 @@ def _create_engagement_campaign(
                     campaign_type,
                     json.dumps(template_map, ensure_ascii=False),
                     int(total_rows),
+                    "active",
+                    None,
                 ),
             )
     except Exception as exc:
@@ -2797,6 +6300,24 @@ def _fetch_engagement_campaigns(
     try:
         conn = get_mysql()
         with conn.cursor() as cur:
+            available = _get_table_columns(conn, ENGAGEMENT_CAMPAIGN_TABLE)
+            select_cols = [
+                "id",
+                "admin_email",
+                "source_filename",
+                "campaign_type",
+                "total_rows",
+                "sent_count",
+                "failed_count",
+                "skipped_count",
+                "created_at",
+            ]
+            if "status" in available:
+                select_cols.append("status")
+            if "status_reason" in available:
+                select_cols.append("status_reason")
+            if "status_updated_at" in available:
+                select_cols.append("status_updated_at")
             where_clause = ""
             params: List[Any] = []
             if campaign_type:
@@ -2807,8 +6328,7 @@ def _fetch_engagement_campaigns(
                 params.append(campaign_type)
             cur.execute(
                 f"""
-                SELECT id, admin_email, source_filename, campaign_type, total_rows, sent_count,
-                       failed_count, skipped_count, created_at
+                SELECT {', '.join(select_cols)}
                 FROM {ENGAGEMENT_CAMPAIGN_TABLE}
                 {where_clause}
                 ORDER BY created_at DESC
@@ -2819,6 +6339,11 @@ def _fetch_engagement_campaigns(
             rows = cur.fetchall() or []
         for row in rows:
             row["campaign_type"] = row.get("campaign_type") or ENGAGEMENT_CAMPAIGN_TYPE_PERFORMANCE
+            row["status"] = row.get("status") or "active"
+            if "status_reason" in row:
+                row["status_reason"] = row.get("status_reason")
+            if "status_updated_at" in row:
+                row["status_updated_at"] = row.get("status_updated_at")
         return rows
     except Exception as exc:
         log.debug("fetch engagement campaigns failed: %s", exc)
@@ -2832,10 +6357,28 @@ def _fetch_engagement_campaign(campaign_id: str) -> Optional[Dict[str, Any]]:
     try:
         conn = get_mysql()
         with conn.cursor() as cur:
+            available = _get_table_columns(conn, ENGAGEMENT_CAMPAIGN_TABLE)
+            select_cols = [
+                "id",
+                "admin_email",
+                "source_filename",
+                "campaign_type",
+                "template_map_json",
+                "total_rows",
+                "sent_count",
+                "failed_count",
+                "skipped_count",
+                "created_at",
+            ]
+            if "status" in available:
+                select_cols.append("status")
+            if "status_reason" in available:
+                select_cols.append("status_reason")
+            if "status_updated_at" in available:
+                select_cols.append("status_updated_at")
             cur.execute(
                 f"""
-                SELECT id, admin_email, source_filename, campaign_type, template_map_json, total_rows,
-                       sent_count, failed_count, skipped_count, created_at
+                SELECT {', '.join(select_cols)}
                 FROM {ENGAGEMENT_CAMPAIGN_TABLE}
                 WHERE id=%s
                 LIMIT 1
@@ -2846,6 +6389,11 @@ def _fetch_engagement_campaign(campaign_id: str) -> Optional[Dict[str, Any]]:
         if not row:
             return None
         row["campaign_type"] = row.get("campaign_type") or ENGAGEMENT_CAMPAIGN_TYPE_PERFORMANCE
+        row["status"] = row.get("status") or "active"
+        if "status_reason" in row:
+            row["status_reason"] = row.get("status_reason")
+        if "status_updated_at" in row:
+            row["status_updated_at"] = row.get("status_updated_at")
         row["template_map"] = _safe_json_load(row.get("template_map_json"), default={})
         return row
     except Exception as exc:
@@ -4055,6 +7603,51 @@ def _fetch_message_logs(
         return []
 
 
+def _fetch_latest_inbound_timestamps(wa_ids: List[str]) -> Dict[str, datetime]:
+    if not (mysql_available() and wa_ids):
+        return {}
+    try:
+        conn = get_mysql()
+    except Exception:
+        return {}
+    try:
+        table = _detect_logs_table(conn)
+        available = _get_table_columns(conn, table)
+        wa_col = _pick_log_column(available, ["wa_id", "phone", "phone_number"])
+        dir_col = _pick_log_column(available, ["message_direction", "direction"])
+        ts_col = _pick_log_column(available, ["timestamp", "created_at", "logged_at"])
+        if not (wa_col and dir_col and ts_col):
+            return {}
+        results: Dict[str, datetime] = {}
+        chunk_size = 200
+        for i in range(0, len(wa_ids), chunk_size):
+            batch = wa_ids[i : i + chunk_size]
+            placeholders = ", ".join(["%s"] * len(batch))
+            sql = (
+                f"SELECT {wa_col} AS wa_id, MAX({ts_col}) AS ts "
+                f"FROM {table} "
+                f"WHERE {wa_col} IN ({placeholders}) AND UPPER({dir_col})='INBOUND' "
+                f"GROUP BY {wa_col}"
+            )
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple(batch))
+                rows = cur.fetchall() or []
+            for row in rows:
+                wa_val = row.get("wa_id")
+                if not wa_val:
+                    continue
+                ts = _parse_log_timestamp(row.get("ts"))
+                if not ts:
+                    continue
+                existing = results.get(wa_val)
+                if existing is None or ts > existing:
+                    results[wa_val] = ts
+        return results
+    except Exception as exc:
+        log.debug("fetch latest inbound timestamps failed: %s", exc)
+        return {}
+
+
 def _fetch_status_map_for_message_ids(message_ids: List[str]) -> Dict[str, Dict[str, Any]]:
     if not (mysql_available() and message_ids):
         return {}
@@ -4119,9 +7712,50 @@ def _is_payment_commitment_message(text: str, intent: Optional[str]) -> bool:
     lowered = (text or "").lower()
     if any(keyword in lowered for keyword in CASH_BALANCE_UPDATE_KEYWORDS):
         return True
-    if re.search(r"\\b(pay|paid|payment|settle|settled|will pay|will settle)\\b", lowered):
+    if re.search(r"\b(pay|paid|payment|settle|settled|will pay|will settle)\b", lowered):
         return True
     return False
+
+def _is_payment_plan_request(text: str) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    if any(kw in lowered for kw in ("already paid", "paid already", "already settled", "just paid")):
+        return False
+    patterns = [
+        r"\b(will|gonna|going to|plan(?:ning)? to|intend to)\s+(pay|settle|clear)\b",
+        r"\b(pay|settle)\s+(today|tomorrow|tonight|this week|by\s+\w+)\b",
+        r"\b(start|begin|plan)\s+pay(?:ing)?\b",
+    ]
+    return any(re.search(pat, lowered) for pat in patterns)
+
+def _parse_payment_amount(text: str) -> Optional[float]:
+    if not text:
+        return None
+    match = re.search(r"(\d+(?:[.,]\d{1,2})?)", text)
+    if not match:
+        return None
+    candidate = match.group(1).replace(",", "")
+    try:
+        return float(candidate)
+    except Exception:
+        return None
+
+def _extract_payment_date_hint(text: str) -> Optional[str]:
+    if not text:
+        return None
+    lowered = text.lower()
+    for keyword in ("today", "todays", "tonight"):
+        if keyword in lowered:
+            return "today"
+    if "tomorrow" in lowered:
+        return "tomorrow"
+    if "this week" in lowered:
+        return "this week"
+    m = re.search(r"\bby\s+([A-Za-z]+)\b", lowered)
+    if m:
+        return f"by {m.group(1)}"
+    return None
 
 def _is_kpi_commitment_message(text: str, intent: Optional[str]) -> bool:
     if not text:
@@ -4222,18 +7856,56 @@ def _decode_data_url_to_bytes(data_url: str) -> Optional[tuple[str, bytes]]:
         return None
 
 
-def fetch_driver_issue_tickets(limit: int = 50, status_filter: Optional[str] = None) -> List[Dict[str, Any]]:
+def fetch_driver_issue_tickets(
+    limit: int = 50,
+    status_filter: Optional[List[str]] = None,
+    issue_types: Optional[List[str]] = None,
+    assignees: Optional[List[str]] = None,
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+) -> List[Dict[str, Any]]:
     if not mysql_available():
         return []
     limit = max(1, min(limit, 200))
-    where_clause = ""
+    where_clauses: List[str] = []
     params: List[Any] = []
     if status_filter:
-        where_clause = "WHERE status=%s"
-        params.append(status_filter)
+        normalized = [str(s).strip().lower() for s in status_filter if str(s).strip()]
+        if normalized:
+            placeholders = ", ".join(["%s"] * len(normalized))
+            where_clauses.append(f"LOWER(status) IN ({placeholders})")
+            params.extend(normalized)
+    if issue_types:
+        normalized = [str(t).strip().lower() for t in issue_types if str(t).strip()]
+        if normalized:
+            placeholders = ", ".join(["%s"] * len(normalized))
+            where_clauses.append(f"LOWER(issue_type) IN ({placeholders})")
+            params.extend(normalized)
+    if assignees:
+        normalized = [str(a).strip().lower() for a in assignees if str(a).strip()]
+        if normalized:
+            wants_unassigned = "__unassigned__" in normalized
+            email_values = [val for val in normalized if val != "__unassigned__"]
+            sub_clauses: List[str] = []
+            if email_values:
+                placeholders = ", ".join(["%s"] * len(email_values))
+                sub_clauses.append(f"LOWER(assigned_admin_email) IN ({placeholders})")
+                params.extend(email_values)
+            if wants_unassigned:
+                sub_clauses.append("(assigned_admin_email IS NULL OR assigned_admin_email='')")
+            if sub_clauses:
+                where_clauses.append(f"({' OR '.join(sub_clauses)})")
+    if date_from:
+        where_clauses.append("DATE(created_at) >= %s")
+        params.append(date_from.isoformat())
+    if date_to:
+        where_clauses.append("DATE(created_at) <= %s")
+        params.append(date_to.isoformat())
+    where_clause = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
     sql = f"""
-        SELECT id, wa_id, issue_type, status, initial_message, location_desc,
-               last_update_at, created_at, metadata, media_urls
+        SELECT id, wa_id, issue_type, status, assigned_admin_email,
+               initial_message, location_desc, last_update_at, created_at,
+               metadata, media_urls
         FROM {ISSUE_TICKET_TABLE}
         {where_clause}
         ORDER BY COALESCE(last_update_at, created_at) DESC
@@ -4254,6 +7926,183 @@ def fetch_driver_issue_tickets(limit: int = 50, status_filter: Optional[str] = N
     return rows
 
 
+def assign_driver_issue_tickets(
+    ticket_ids: List[int],
+    assignee_email: str,
+    admin_email: Optional[str] = None,
+    *,
+    allow_reassign: bool = False,
+) -> Tuple[int, int]:
+    if not mysql_available():
+        return 0, len(ticket_ids or [])
+    clean_email = _normalize_email(assignee_email) or (assignee_email or "").strip()
+    if not clean_email:
+        return 0, len(ticket_ids or [])
+    clean_ids: List[int] = []
+    for value in ticket_ids or []:
+        try:
+            clean_ids.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    clean_ids = sorted(set([i for i in clean_ids if i > 0]))
+    if not clean_ids:
+        return 0, 0
+    conn = get_mysql()
+    if not _table_exists(conn, ISSUE_TICKET_TABLE):
+        return 0, len(clean_ids)
+
+    placeholders = ", ".join(["%s"] * len(clean_ids))
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, assigned_admin_email
+                FROM {ISSUE_TICKET_TABLE}
+                WHERE id IN ({placeholders})
+                """,
+                tuple(clean_ids),
+            )
+            rows = cur.fetchall() or []
+    except Exception as exc:
+        log.error("Failed to fetch tickets for assignment: %s", exc)
+        return 0, len(clean_ids)
+
+    if allow_reassign:
+        normalized_target = clean_email.lower()
+        to_update: List[int] = []
+        update_rows: List[Dict[str, Any]] = []
+        for row in rows:
+            current = (row.get("assigned_admin_email") or "").strip()
+            if current.lower() == normalized_target:
+                continue
+            ticket_id = row.get("id")
+            if not ticket_id:
+                continue
+            to_update.append(ticket_id)
+            update_rows.append(row)
+        skipped = len(clean_ids) - len(to_update)
+        if not to_update:
+            return 0, skipped
+    else:
+        update_rows = [
+            row
+            for row in rows
+            if not (row.get("assigned_admin_email") or "").strip()
+        ]
+        to_update = [row.get("id") for row in update_rows if row.get("id")]
+        skipped = len(clean_ids) - len(to_update)
+        if not to_update:
+            return 0, skipped
+
+    placeholders = ", ".join(["%s"] * len(to_update))
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE {ISSUE_TICKET_TABLE}
+                SET assigned_admin_email=%s
+                WHERE id IN ({placeholders})
+                """,
+                tuple([clean_email] + to_update),
+            )
+    except Exception as exc:
+        log.error("Failed to assign tickets: %s", exc)
+        return 0, len(clean_ids)
+
+    for row in update_rows:
+        ticket_id = row.get("id")
+        if not ticket_id:
+            continue
+        previous = (row.get("assigned_admin_email") or "").strip()
+        action = "reassign" if previous else "assign"
+        note = f"Assigned to {clean_email}"
+        if previous:
+            note = f"Assigned to {clean_email} (was {previous})"
+        log_driver_issue_ticket_event(
+            ticket_id,
+            admin_email=admin_email,
+            action_type=action,
+            note=note,
+        )
+    return len(to_update), skipped
+
+
+def unassign_driver_issue_tickets(
+    ticket_ids: List[int],
+    admin_email: Optional[str] = None,
+) -> Tuple[int, int]:
+    if not mysql_available():
+        return 0, len(ticket_ids or [])
+    clean_ids: List[int] = []
+    for value in ticket_ids or []:
+        try:
+            clean_ids.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    clean_ids = sorted(set([i for i in clean_ids if i > 0]))
+    if not clean_ids:
+        return 0, 0
+    conn = get_mysql()
+    if not _table_exists(conn, ISSUE_TICKET_TABLE):
+        return 0, len(clean_ids)
+
+    placeholders = ", ".join(["%s"] * len(clean_ids))
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, assigned_admin_email
+                FROM {ISSUE_TICKET_TABLE}
+                WHERE id IN ({placeholders})
+                """,
+                tuple(clean_ids),
+            )
+            rows = cur.fetchall() or []
+    except Exception as exc:
+        log.error("Failed to fetch tickets for unassignment: %s", exc)
+        return 0, len(clean_ids)
+
+    assigned_rows = [
+        row
+        for row in rows
+        if (row.get("assigned_admin_email") or "").strip()
+    ]
+    assigned_ids = [row.get("id") for row in assigned_rows if row.get("id")]
+    skipped = len(clean_ids) - len(assigned_ids)
+    if not assigned_ids:
+        return 0, skipped
+
+    placeholders = ", ".join(["%s"] * len(assigned_ids))
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE {ISSUE_TICKET_TABLE}
+                SET assigned_admin_email=NULL
+                WHERE id IN ({placeholders})
+                  AND (assigned_admin_email IS NOT NULL AND assigned_admin_email!='')
+                """,
+                tuple(assigned_ids),
+            )
+    except Exception as exc:
+        log.error("Failed to unassign tickets: %s", exc)
+        return 0, len(clean_ids)
+
+    for row in assigned_rows:
+        ticket_id = row.get("id")
+        if not ticket_id:
+            continue
+        previous_assignee = (row.get("assigned_admin_email") or "").strip()
+        note = f"Unassigned from {previous_assignee}" if previous_assignee else "Unassigned"
+        log_driver_issue_ticket_event(
+            ticket_id,
+            admin_email=admin_email,
+            action_type="unassign",
+            note=note,
+        )
+    return len(assigned_ids), skipped
+
+
 def fetch_driver_issue_ticket(ticket_id: int) -> Optional[Dict[str, Any]]:
     if not (mysql_available() and ticket_id):
         return None
@@ -4262,9 +8111,9 @@ def fetch_driver_issue_ticket(ticket_id: int) -> Optional[Dict[str, Any]]:
         with conn.cursor() as cur:
             cur.execute(
                 f"""
-                SELECT id, wa_id, issue_type, status, initial_message, location_desc,
-                       location_lat, location_lng, metadata, media_urls,
-                       last_update_at, created_at
+                SELECT id, wa_id, issue_type, status, assigned_admin_email,
+                       initial_message, location_desc, location_lat, location_lng,
+                       metadata, media_urls, last_update_at, created_at
                 FROM {ISSUE_TICKET_TABLE}
                 WHERE id=%s
                 LIMIT 1
@@ -4294,8 +8143,9 @@ def fetch_open_driver_issue_ticket(
     params: List[Any] = [wa_id]
     params.extend(closed_vals)
     sql = f"""
-        SELECT id, wa_id, issue_type, status, initial_message, location_desc,
-               last_update_at, created_at, metadata, media_urls
+        SELECT id, wa_id, issue_type, status, assigned_admin_email,
+               initial_message, location_desc, last_update_at, created_at,
+               metadata, media_urls
         FROM {ISSUE_TICKET_TABLE}
         WHERE wa_id=%s
           AND (status IS NULL OR status='' OR LOWER(status) NOT IN ({closed_placeholders}))
@@ -4393,8 +8243,32 @@ def _safe_json_load(raw: Optional[Any], default: Any = None):
         return default if default is not None else {}
 
 
+LICENSE_DISK_STATUS_OPTIONS = [
+    "renewal_due",
+    "roadworthy_completed",
+    "uploaded_on_cancom",
+    "ready_to_collect",
+    "collected",
+    "install_completed",
+]
+
+
 def get_ticket_status_options(limit: int = 12) -> List[str]:
-    defaults = ["collecting", "pending_ops", "pending_driver", "driver_confirmed_resolved", "closed"]
+    defaults = [
+        "collecting",
+        "pending_ops",
+        "pending_driver",
+        "to_collect",
+        "renewal_due",
+        "roadworthy_completed",
+        "uploaded_on_cancom",
+        "ready_to_collect",
+        "collected",
+        "install_completed",
+        "renewal_completed",
+        "driver_confirmed_resolved",
+        "closed",
+    ]
     if not mysql_available():
         return defaults
     try:
@@ -4415,6 +8289,45 @@ def get_ticket_status_options(limit: int = 12) -> List[str]:
             seen.add(status)
             merged.append(status)
     return merged
+
+
+def _issue_allowed_statuses(issue_type: Optional[str]) -> List[str]:
+    entry = _issue_config_entry(issue_type)
+    if entry:
+        configured = _sanitize_issue_statuses(entry.get("statuses"))
+        if configured:
+            return configured
+    if _normalize_issue_key(issue_type) == "license_disk_renewal":
+        return list(LICENSE_DISK_STATUS_OPTIONS)
+    return []
+
+
+def _filter_status_options_for_issue(
+    issue_type: Optional[str],
+    status_options: Optional[List[str]],
+    current_status: Optional[str] = None,
+) -> List[str]:
+    base = list(status_options or [])
+    allowed = _issue_allowed_statuses(issue_type)
+    if allowed:
+        allowed_set = set(allowed)
+        filtered = [status for status in base if status in allowed_set]
+        for status in allowed:
+            if status not in filtered:
+                filtered.append(status)
+    else:
+        filtered = base
+    current = _normalize_status_value(current_status)
+    if current and current not in filtered:
+        filtered.append(current)
+    return filtered
+
+
+def _status_requires_admin_note(status: Optional[str]) -> bool:
+    normalized = (status or "").strip().lower().replace(" ", "_")
+    if not normalized:
+        return False
+    return normalized in {"closed", "driver_confirmed_resolved", "completed", "install_completed"}
 
 
 
@@ -4631,6 +8544,7 @@ CLOSED_TICKET_STATUS_VALUES = {
     "success",
     "successful",
 }
+BLOCKING_TICKET_STATUS_VALUES = {"collecting", "pending_ops"}
 
 def _normalize_ticket_status(value: Optional[Any]) -> str:
     return str(value or "").strip().lower()
@@ -4663,6 +8577,30 @@ def _ticket_status_from_db(ticket_id: Optional[int], ctx: Dict[str, Any]) -> Opt
         status = _normalize_ticket_status(ticket.get("status"))
     cache[cache_key] = {"status": status, "checked_at": time.time()}
     return status
+
+
+def _is_ticket_status_blocking(status: Optional[Any]) -> bool:
+    status_clean = _normalize_ticket_status(status)
+    return bool(status_clean and status_clean in BLOCKING_TICKET_STATUS_VALUES)
+
+
+def _blocking_ticket_for_agentic_ai(wa_id: str, ctx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    ticket_id = ctx.get("_blocking_ticket_id")
+    if ticket_id:
+        status = _ticket_status_from_db(ticket_id, ctx)
+        if _is_ticket_status_blocking(status):
+            return {"id": ticket_id, "status": status}
+        ctx.pop("_blocking_ticket_id", None)
+        ctx.pop("_blocking_ticket_status", None)
+    ticket = fetch_open_driver_issue_ticket(wa_id)
+    if not isinstance(ticket, dict):
+        return None
+    status = _normalize_ticket_status(ticket.get("status"))
+    if not _is_ticket_status_blocking(status):
+        return None
+    ctx["_blocking_ticket_id"] = ticket.get("id")
+    ctx["_blocking_ticket_status"] = status
+    return ticket
 
 def _ticket_ctx_is_closed(ticket_ctx: Optional[Dict[str, Any]], ctx: Dict[str, Any]) -> bool:
     if not isinstance(ticket_ctx, dict):
@@ -4700,8 +8638,12 @@ def _clear_closed_ticket_context(ctx: Dict[str, Any]) -> None:
         ("_low_demand_ticket", "low_demand", "_low_demand_"),
         ("_account_suspension_ticket", "account_suspension", "_account_suspension_"),
         ("_app_issue_ticket", "app_issue", "_app_issue_"),
+        ("_branding_campaign_ticket", "branding_campaign", None),
+        ("_vehicle_category_ticket", "vehicle_category", None),
+        ("_safety_incident_ticket", "safety_incident", None),
         ("_car_ticket", "car", None),
         ("_cash_ticket", "cash_ride", None),
+        ("_payment_plan_ticket", "payment_plan", None),
         ("_accident_case", "accident", None),
     ]
     for ticket_key, concern_type, prefix in ticket_specs:
@@ -4711,6 +8653,16 @@ def _clear_closed_ticket_context(ctx: Dict[str, Any]) -> None:
             if prefix:
                 _clear_context_prefix(ctx, prefix)
             closed_types.add(concern_type)
+
+    for key in list(ctx.keys()):
+        if not key.startswith("_issue_ticket_"):
+            continue
+        ticket_ctx = ctx.get(key)
+        if isinstance(ticket_ctx, dict) and _ticket_ctx_is_closed(ticket_ctx, ctx):
+            ctx.pop(key, None)
+            issue_type = ticket_ctx.get("issue_type") or key.replace("_issue_ticket_", "")
+            if issue_type:
+                closed_types.add(issue_type)
 
     if not closed_types:
         return
@@ -4739,12 +8691,153 @@ def _clear_closed_ticket_context(ctx: Dict[str, Any]) -> None:
         closed_intents.add("account_suspension")
     if "app_issue" in closed_types:
         closed_intents.add("app_issue")
+    if "branding_campaign" in closed_types:
+        closed_intents.add(BRANDING_CAMPAIGN_INTENT)
+    if "vehicle_category" in closed_types:
+        closed_intents.add(VEHICLE_CATEGORY_INTENT)
+    if "safety_incident" in closed_types:
+        closed_intents.add(SAFETY_INCIDENT_INTENT)
     if "cash_ride" in closed_types:
         closed_intents.add(CASH_BALANCE_UPDATE_INTENT)
     if "accident" in closed_types:
         closed_intents.add(ACCIDENT_REPORT_INTENT)
     if ctx.get("_last_intent") in closed_intents:
         ctx.pop("_last_intent", None)
+
+def _record_campaign_pause_context(
+    wa_id: str,
+    *,
+    campaign_id: str,
+    reason: Optional[str],
+) -> bool:
+    if not wa_id:
+        return False
+    ctx = load_context_file(wa_id)
+    now_ts = time.time()
+    ctx["_global_opt_out"] = True
+    ctx["_global_opt_out_at"] = now_ts
+    ctx["_engagement_followup_paused"] = True
+    ctx["_engagement_followup_paused_at"] = now_ts
+    ctx["_intraday_updates_enabled"] = False
+    ctx["_intraday_updates_paused"] = True
+    ctx["_intraday_updates_paused_at"] = now_ts
+    if reason:
+        ctx["_campaign_pause_reason"] = reason
+    ctx["_paused_campaign_id"] = campaign_id
+    save_context_file(wa_id, ctx)
+    prefs: Dict[str, Any] = {"paused_campaign_id": campaign_id}
+    if reason:
+        prefs["pause_reason"] = reason
+    save_context_db(wa_id, "opt_out", reason or "campaign paused", prefs)
+    return True
+
+
+def _pause_engagement_campaign_drivers(
+    campaign_id: str,
+    *,
+    reason: Optional[str] = None,
+) -> int:
+    if not campaign_id:
+        return 0
+    rows = _fetch_engagement_rows(campaign_id)
+    wa_ids = {row.get("wa_id") for row in rows if row.get("wa_id")}
+    if not wa_ids:
+        log.debug("Campaign %s pause applied to no drivers (no rows)", campaign_id)
+        return 0
+    paused = 0
+    for wa_id in wa_ids:
+        if _record_campaign_pause_context(wa_id, campaign_id=campaign_id, reason=reason):
+            paused += 1
+    log.info(
+        "Marked %d driver contexts as opted out for campaign %s (reason=%s)",
+        paused,
+        campaign_id,
+        reason or "campaign paused",
+    )
+    return paused
+
+
+def _resume_campaign_driver_context(
+    wa_id: str,
+    *,
+    campaign_id: str,
+) -> bool:
+    if not wa_id:
+        return False
+    ctx = load_context_file(wa_id)
+    if ctx.get("_paused_campaign_id") != campaign_id:
+        return False
+    for key in (
+        "_global_opt_out",
+        "_global_opt_out_at",
+        "_engagement_followup_paused",
+        "_engagement_followup_paused_at",
+        "_campaign_pause_reason",
+        "_intraday_updates_paused",
+        "_intraday_updates_paused_at",
+    ):
+        ctx.pop(key, None)
+    ctx.pop("_paused_campaign_id", None)
+    save_context_file(wa_id, ctx)
+    if mysql_available():
+        prefs = {"resumed_campaign_id": campaign_id}
+        save_context_db(wa_id, "opt_in", "campaign resumed", prefs)
+    return True
+
+
+def _resume_engagement_campaign_drivers(
+    campaign_id: str,
+) -> int:
+    if not campaign_id:
+        return 0
+    rows = _fetch_engagement_rows(campaign_id)
+    wa_ids = {row.get("wa_id") for row in rows if row.get("wa_id")}
+    if not wa_ids:
+        log.debug("Campaign %s activation touched no drivers (no rows)", campaign_id)
+        return 0
+    resumed = 0
+    for wa_id in wa_ids:
+        if _resume_campaign_driver_context(wa_id, campaign_id=campaign_id):
+            resumed += 1
+    log.info(
+        "Reactivated %d driver contexts for campaign %s",
+        resumed,
+        campaign_id,
+    )
+    return resumed
+
+def _set_engagement_campaign_status(
+    campaign_id: str,
+    status: str,
+    *,
+    reason: Optional[str] = None,
+) -> bool:
+    if not (mysql_available() and campaign_id):
+        return False
+    normalized = (status or "").strip().lower() or "active"
+    updates = ["status=%s", "status_updated_at=CURRENT_TIMESTAMP"]
+    params: List[Any] = [normalized]
+    if reason:
+        updates.append("status_reason=%s")
+        params.append(reason)
+    elif normalized == "active":
+        updates.append("status_reason=NULL")
+    params.append(campaign_id)
+    try:
+        conn = get_mysql()
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE {ENGAGEMENT_CAMPAIGN_TABLE}
+                SET {', '.join(updates)}
+                WHERE id=%s
+                """,
+                tuple(params),
+            )
+            return cur.rowcount > 0
+    except Exception as exc:
+        log.debug("set engagement campaign status failed: %s", exc)
+        return False
 
 MEDIA_INTENT_OVERRIDES = {
     "image": "media_image",
@@ -4765,7 +8858,9 @@ def resolve_context_intent(
     ctx: Dict[str, Any],
     message_text: str,
 ) -> str:
-    message_text = _normalize_text(message_text or "")
+    raw_message_text = message_text or ""
+    message_text = _normalize_text(raw_message_text)
+    lowered_message = message_text.lower()
     accident_ctx = ctx.get("_accident_case") if isinstance(ctx.get("_accident_case"), dict) else None
     accident_status = accident_ctx.get("status") if accident_ctx else None
     accident_awaiting = accident_ctx.get("awaiting") if accident_ctx else None
@@ -4773,7 +8868,15 @@ def resolve_context_intent(
     accident_active = (accident_status in {"collecting", "pending_ops"}) and not accident_closed
     accident_waiting = accident_active and bool(accident_awaiting)
 
+    if _is_car_ticket_followup(raw_message_text, ctx):
+        return "car_problem"
+    if re.search(r"\b(?:can|will|gonna|going to|able to)\s+(?:to\s+)?pay\b", lowered_message):
+        return CASH_BALANCE_UPDATE_INTENT
+
     if detected_intent and detected_intent != "unknown":
+        if detected_intent == CASH_BALANCE_UPDATE_INTENT:
+            if ctx.get("_balance_dispute_pending") or (ctx.get("_active_concern") or {}).get("type") == "balance_dispute":
+                return "balance_dispute"
         if accident_waiting and detected_intent in {"acknowledgement"}:
             return ACCIDENT_REPORT_INTENT
         return detected_intent
@@ -4810,6 +8913,14 @@ def resolve_context_intent(
         if override:
             return override
         return "media_message"
+
+    car_ticket = ctx.get("_car_ticket")
+    if (
+        isinstance(car_ticket, dict)
+        and car_ticket.get("status") in {"collecting", "pending_ops"}
+        and not car_ticket.get("closed")
+    ):
+        return "car_problem"
 
     pending = ctx.get("_pending_intent")
     if pending in {PENDING_EARNINGS_TRIPS, PENDING_EARNINGS_AVG}:
@@ -4852,6 +8963,9 @@ def resolve_context_intent(
             return "vehicle_repossession"
         if _is_car_problem(message_text):
             return "car_problem"
+        issue_match = _match_issue_keywords(message_text)
+        if issue_match:
+            return issue_match
         if any(kw in lowered for kw in CONCERN_GENERAL_KEYWORDS):
             return "raise_concern"
         if accident_waiting:
@@ -4885,12 +8999,24 @@ def resolve_context_intent(
             return CASH_BALANCE_UPDATE_INTENT
         if concern_type == "branding_bonus":
             return BRANDING_BONUS_INTENT
+        if concern_type == "branding_campaign":
+            return BRANDING_CAMPAIGN_INTENT
+        if concern_type == "vehicle_category":
+            return VEHICLE_CATEGORY_INTENT
+        if concern_type == "safety_incident":
+            return SAFETY_INCIDENT_INTENT
+        if concern_type and _issue_config_entry(concern_type):
+            return concern_type
 
     previous = ctx.get("_last_intent")
     if not lowered and previous and previous != "unknown":
         if previous == ACCIDENT_REPORT_INTENT and (not accident_active) and accident_closed:
             return "clarify"
         return previous
+
+    learning_label = _learning_label_from_message(message_text)
+    if learning_label:
+        return learning_label
 
     return "clarify"
 
@@ -4910,6 +9036,7 @@ def lookup_driver_by_wa(wa_id: str) -> Dict[str, Any]:
         phone_col = _pick_col_exists(conn, table, ["phone", "wa_id", "whatsapp", "whatsapp_number", "wa_number", "phone_number", "contact_number"])
         name_col = _pick_col_exists(conn, table, ["name", "full_name", "driver_name"])
         model_col = _pick_col_exists(conn, table, ["model", "asset_model"])
+        company_col = _pick_col_exists(conn, table, ["company", "company_name", "fleet_company", "owner", "owner_name", "vehicle_company"])
         reg_col = _pick_col_exists(conn, table, ["car_reg_number", "vehicle_number", "registration_number", "reg_number"])
         xero_col = _pick_col_exists(conn, table, ["xero_contact_id", "contact_id", "account_id"])
         personal_col = _pick_col_exists(conn, table, ["personal_code"])
@@ -4931,6 +9058,7 @@ def lookup_driver_by_wa(wa_id: str) -> Dict[str, Any]:
         select_cols = []
         if name_col: select_cols.append(name_col)
         if model_col: select_cols.append(model_col)
+        if company_col: select_cols.append(company_col)
         if reg_col: select_cols.append(reg_col)
         if xero_col: select_cols.append(xero_col)
         if personal_col: select_cols.append(personal_col)
@@ -4969,6 +9097,7 @@ def lookup_driver_by_wa(wa_id: str) -> Dict[str, Any]:
             "last_name": last,
             "display_name": full or f"{first} {last}".strip(),
             "asset_model": row.get(model_col) if model_col else "",
+            "company": row.get(company_col) if company_col else None,
             "car_reg_number": row.get(reg_col) if reg_col else None,
             "xero_contact_ids": xero_ids,
             "personal_code": row.get(personal_col) if personal_col else None,
@@ -5193,6 +9322,9 @@ BALANCE_DISPUTE_KEYWORDS = [
     "balance seems wrong", "balance not right", "not my balance", "not correct",
     "incorrect", "mistake", "error in balance", "statement wrong", "charges wrong",
     "overcharged", "over charged", "charged too much", "shouldn't owe", "shouldnt owe",
+    "payment not on statement", "payment not on the statement", "not on statement",
+    "payment not showing", "payment not reflected", "payment not reflecting",
+    "payment missing", "missing payment", "statement missing payment",
 ]
 
 CASH_ENABLE_KEYWORDS = [
@@ -5231,10 +9363,64 @@ BRANDING_BONUS_KEYWORDS = [
     "campaign bonus", "campaign payout", "advertising bonus", "advertising payout",
     "branding allowance",
 ]
+BRANDING_CAMPAIGN_KEYWORDS = [
+    "branding campaign",
+    "campaign not on",
+    "campaign off",
+    "campaign inactive",
+    "campaign not active",
+    "campaign removed",
+    "campaign stopped",
+    "campaign missing",
+    "not on campaign",
+    "branding not on",
+    "branding off",
+    "branding inactive",
+    "branding campaign not on",
+    "branding earnings",
+    "campaign earnings",
+]
+VEHICLE_CATEGORY_KEYWORDS = [
+    "vehicle category",
+    "bolt category",
+    "category not on",
+    "category off",
+    "category inactive",
+    "category not active",
+    "category missing",
+    "wrong category",
+    "incorrect category",
+    "category issue",
+    "category problem",
+    "no category",
+    "dont have a category",
+    "don't have a category",
+    "category changed",
+]
+SAFETY_INCIDENT_KEYWORDS = [
+    "robbed",
+    "robbery",
+    "hijacked",
+    "hijack",
+    "carjacked",
+    "car jacked",
+    "mugged",
+    "mugging",
+    "armed robbery",
+    "gunpoint",
+    "knife",
+    "assaulted",
+    "attacked",
+    "threatened",
+    "stolen",
+    "theft",
+]
 
 CASH_POP_MEDIA_TYPES = {"image", "document"}
 MEDICAL_CERT_MEDIA_TYPES = {"image", "document"}
 POP_PENDING_TTL_HOURS = int(os.getenv("POP_PENDING_TTL_HOURS", "24"))
+PAYMENT_PLAN_TTL_HOURS = int(os.getenv("PAYMENT_PLAN_TTL_HOURS", "72"))
+PAYMENT_PLAN_WINDOW_DAYS = int(os.getenv("PAYMENT_PLAN_WINDOW_DAYS", "7"))
 POP_CONFIRM_KEYWORDS = [
     "pop",
     "proof of payment",
@@ -5294,6 +9480,7 @@ VEHICLE_BACK_KEYWORDS = [
 
 NO_VEHICLE_WORKSHOP_KEYWORDS = [
     "workshop", "service", "maintenance", "repair", "mechanic", "garage", "broken", "breakdown",
+    "fix", "fixed", "fixing", "being fixed",
 ]
 
 NO_VEHICLE_ASSIGNMENT_KEYWORDS = [
@@ -5391,6 +9578,95 @@ def _pop_prompt_allowed(ctx: Dict[str, Any], intent: str) -> bool:
         return False
     return True
 
+
+def _record_payment_plan(ctx: Dict[str, Any], amount: Optional[float], when_hint: Optional[str]) -> None:
+    if not isinstance(ctx, dict):
+        return
+    plan = ctx.get("_pending_payment_plan")
+    if not isinstance(plan, dict):
+        plan = {}
+    if amount is not None:
+        plan["amount"] = amount
+    if when_hint:
+        plan["when"] = when_hint
+    plan["logged_at"] = time.time()
+    ctx["_pending_payment_plan"] = plan
+
+
+def _resolve_payment_plan_due(when_hint: Optional[str]) -> Optional[date]:
+    today = jhb_now().date()
+    if not when_hint:
+        return today + timedelta(days=PAYMENT_PLAN_WINDOW_DAYS)
+    normalized = when_hint.lower()
+    if "today" in normalized:
+        return today
+    if "tomorrow" in normalized or "tmr" in normalized:
+        return today + timedelta(days=1)
+    if "this week" in normalized:
+        return today + timedelta(days=3)
+    if "next week" in normalized:
+        return today + timedelta(days=7)
+    by_match = re.match(r"by\s+([A-Za-z0-9\-]+)", normalized)
+    if by_match:
+        candidate = by_match.group(1)
+        try:
+            parsed_date = datetime.strptime(candidate, "%Y-%m-%d").date()
+            return parsed_date
+        except Exception:
+            pass
+        for offset in range(0, PAYMENT_PLAN_WINDOW_DAYS + 7):
+            candidate_date = today + timedelta(days=offset)
+            day_name = candidate_date.strftime("%A").lower()
+            if day_name[:3] in candidate or day_name in candidate:
+                return candidate_date
+    return today + timedelta(days=PAYMENT_PLAN_WINDOW_DAYS)
+
+
+def _format_payment_plan_due_description(due_date: Optional[date]) -> str:
+    if due_date:
+        return due_date.strftime("%Y-%m-%d")
+    return f"in {PAYMENT_PLAN_WINDOW_DAYS} days"
+
+
+def _payment_plan_ticket_active(ctx: Dict[str, Any]) -> bool:
+    if not isinstance(ctx, dict):
+        return False
+    ticket_ctx = ctx.get("_payment_plan_ticket")
+    return bool(ticket_ctx and isinstance(ticket_ctx, dict) and not _ticket_ctx_is_closed(ticket_ctx, ctx))
+
+
+def _pending_payment_plan_active(ctx: Dict[str, Any]) -> bool:
+    if not isinstance(ctx, dict):
+        return False
+    plan = ctx.get("_pending_payment_plan")
+    if not isinstance(plan, dict):
+        return False
+    try:
+        logged_at = float(plan.get("logged_at") or 0)
+    except Exception:
+        logged_at = 0
+    if not logged_at:
+        return False
+    if (time.time() - logged_at) > PAYMENT_PLAN_TTL_HOURS * 3600:
+        ctx.pop("_pending_payment_plan", None)
+        return False
+    return bool(plan.get("amount") or plan.get("when"))
+
+
+def _should_skip_pop_followup(ctx: Dict[str, Any], msg: Optional[str], message_type: Optional[str]) -> bool:
+    if message_type and message_type in CASH_POP_MEDIA_TYPES:
+        return False
+    if _pending_payment_plan_active(ctx):
+        return True
+    if _payment_plan_ticket_active(ctx):
+        return True
+    if not msg:
+        return False
+    plan_request = _is_payment_plan_request(msg)
+    if plan_request:
+        return True
+    return _is_payment_commitment_message(msg, None)
+
 REPOSSESSION_BALANCE_KEYWORDS = [
     "outstanding",
     "balance",
@@ -5428,7 +9704,7 @@ REPOSSESSION_BEHAVIOR_KEYWORDS = [
 ]
 
 CAR_PROBLEM_VEHICLE_TERMS = {
-    "car", "vehicle", "cab", "taxi", "qute", "vitz", "suzuki", "almera", "micra",
+    "car", "vehicle", "cab", "taxi", "qute", "vitz", "suzuki", "almera", "micra", "mechanical",
     "engine", "gearbox", "motor", "brake", "brakes", "tyre", "tire", "wheel", "battery",
 }
 
@@ -5436,9 +9712,70 @@ CAR_PROBLEM_SYMPTOM_TERMS = {
     "problem", "issue", "broken", "broke", "fault", "leak", "leaking", "leaks",
     "smoke", "smoking", "overheat", "overheating", "won't start", "wont start", "won't move",
     "wont move", "stalled", "stuck", "noisy", "noise", "warning", "light", "flat",
+    "not working",
 }
 
 CAR_PROBLEM_MEDIA_TYPES = {"image", "video", "document"}
+CAR_DRIVABLE_POSITIVE_PHRASES = [
+    "can still drive", "still drive", "can drive", "can driver", "still driver", "able to drive", "driving it",
+    "driving the car", "still running", "still runs", "still moving", "drivable",
+]
+CAR_DRIVABLE_NEGATIVE_PHRASES = [
+    "can't drive", "cannot drive", "cant drive", "won't drive", "wont drive",
+    "unable to drive", "can't move", "cannot move", "cant move", "won't move", "wont move",
+    "not drivable", "not driveable", "can't start", "cannot start", "cant start",
+]
+CAR_POLICY_KEYWORDS = {
+    "policy number", "policy no", "policy #", "policy", "insurance",
+    "tow", "towing", "tow truck", "towtruck",
+    "license disk", "licence disk", "license disc", "licence disc",
+}
+POLICY_NUMBER_QUERY_PHRASES = {"policy number", "policy no", "policy #"}
+TOW_ARRANGED_KEYWORDS = {
+    "tow arranged",
+    "towing arranged",
+    "tow booked",
+    "tow sorted",
+    "tow truck coming",
+    "tow truck dispatched",
+    "tow truck is here",
+    "tow already arranged",
+    "tow is arranged",
+    "tow truck arranged",
+}
+POLICY_NUMBER_QUERY_PHRASES = {"policy number", "policy no", "policy #"}
+WORKSHOP_LOCATION_KEYWORDS = {
+    "workshop", "mechanic", "garage", "service", "maintenance", "repair",
+}
+WORKSHOP_TRAVEL_PATTERNS = [
+    r"\b(?:on (?:my |the )?way to|heading to|going to|driving(?: (?:my|the)?\s*(?:car|vehicle))? to|taking (?:it|the car|car|the vehicle|vehicle)? to|dropping (?:it|the car|car|the vehicle|vehicle)? at)\s+([a-z0-9][a-z0-9 &'.\-]{2,})",
+]
+WORKSHOP_DESTINATION_QUESTION_PATTERNS = [
+    r"\bwhere\b.*\b(take|go|drive|drop)\b.*\b(car|vehicle)\b",
+    r"\bwhere\b.*\b(workshop|garage|mechanic)\b",
+    r"\bwhich\b.*\b(workshop|garage|mechanic)\b",
+]
+KNOWN_WORKSHOP_NAMES = {
+    "transrev": "TransRev",
+    "transrev rsa": "TransRev Rsa",
+}
+MODEL_WORKSHOP_MAP = {
+    # Fill with model-specific workshops, or override with MODEL_WORKSHOP_MAP_JSON.
+    # Example: "suzuki s-presso": {"name": "TransRev", "address": "123 Example Rd"},
+}
+_model_workshop_env = os.getenv("MODEL_WORKSHOP_MAP_JSON", "").strip()
+if _model_workshop_env:
+    try:
+        _model_workshop_payload = json.loads(_model_workshop_env)
+        if isinstance(_model_workshop_payload, dict):
+            MODEL_WORKSHOP_MAP.update(_model_workshop_payload)
+        else:
+            log.warning("MODEL_WORKSHOP_MAP_JSON must be a JSON object; ignoring.")
+    except Exception as exc:
+        log.warning("Invalid MODEL_WORKSHOP_MAP_JSON: %s", exc)
+MODEL_WORKSHOP_MAP = {str(k).strip().lower(): v for k, v in MODEL_WORKSHOP_MAP.items() if str(k).strip()}
+DEFAULT_WORKSHOP_NAME = _env("DEFAULT_WORKSHOP_NAME")
+DEFAULT_WORKSHOP_ADDRESS = _env("DEFAULT_WORKSHOP_ADDRESS")
 CAR_PROBLEM_RESOLUTION_KEYWORDS = [
     "sorted out",
     "sorted now",
@@ -5484,6 +9821,20 @@ ACCIDENT_KEYWORDS = [
     "got rammed",
     "knocked into",
 ]
+ACCIDENT_CANCEL_PATTERNS = [
+    r"\bno (?:accident|crash|collision)\b",
+    r"\bnot (?:an|a)?\s*(?:accident|crash|collision)\b",
+    r"\bthere(?:'s| is) no (?:accident|crash|collision)\b",
+    r"\bnot involved in (?:an|a)?\s*(?:accident|crash|collision)\b",
+    r"\bwas(?:n't| not) in (?:an|a)?\s*(?:accident|crash|collision)\b",
+    r"\bfalse alarm\b",
+    r"\bwrong (?:report|message|chat)\b",
+    r"\bignore (?:this|it)\b",
+    r"\bmy mistake\b",
+    r"\bmistake\b",
+    r"\bno incident\b",
+    r"\bnothing happened\b",
+]
 
 ACCIDENT_VERB_TERMS = {
     "accident",
@@ -5516,6 +9867,58 @@ ACCIDENT_OBJECT_TERMS = {
 }
 
 ACCIDENT_MEDIA_TYPES = {"image", "video", "document"}
+ACCIDENT_PHOTO_STATE_KEYS = {
+    "damage": "damage_photo_received",
+    "plate": "plate_photo_received",
+    "license_disk": "license_disk_photo_received",
+    "driver_license": "driver_license_photo_received",
+    "other_driver_license": "other_driver_license_photo_received",
+}
+ACCIDENT_PHOTO_LABELS = {
+    "damage": "the vehicle damage",
+    "plate": "the vehicle license plate",
+    "license_disk": "the license disk (shows model and company)",
+    "driver_license": "your driver's license",
+    "other_driver_license": "the other driver's license",
+}
+ACCIDENT_PHOTO_ACK_LABELS = {
+    "damage": "damage",
+    "plate": "license plate",
+    "license_disk": "license disk",
+    "driver_license": "driver's license",
+    "other_driver_license": "other driver's license",
+}
+ACCIDENT_PHOTO_DAMAGE_KEYWORDS = {
+    "damage", "damaged", "damages", "dent", "dented", "scratch", "scratches", "crack", "cracked",
+    "broken", "bumper", "bonnet", "boot", "front", "rear", "side", "fender",
+}
+ACCIDENT_PHOTO_PLATE_KEYWORDS = {
+    "plate", "number plate", "license plate", "licence plate", "registration", "reg plate", "plate number",
+}
+ACCIDENT_PHOTO_LICENSE_DISK_KEYWORDS = {
+    "license disk", "licence disk", "license disc", "licence disc",
+    "operator card", "operator's card", "operator card",
+}
+ACCIDENT_PHOTO_LICENSE_KEYWORDS = {
+    "driver's license", "drivers license", "drivers licence", "driver license", "driver licence",
+    "driving license", "driving licence", "licence", "license", "dl", "id book", "id card",
+}
+ACCIDENT_PHOTO_OTHER_DRIVER_KEYWORDS = {
+    "other driver", "third party", "other party", "other license", "other licence", "other driver's",
+}
+
+ACCIDENT_TOWING_NUMBER = "0861235663"
+TOWING_FOLLOWUP_DELAY_SECONDS = int(os.getenv("TOWING_FOLLOWUP_DELAY_SECONDS", str(15 * 60)))
+ACCIDENT_POLICY_ENTRIES = [
+    {"company": "MNCBJJ", "model": "BAJAJ", "policy_number": "ED000005"},
+    {"company": "MNCBJJ", "model": "S-PRESSO & VITZ", "policy_number": "RTUEF0037"},
+    {"company": "MNC", "model": "DZIRE", "policy_number": "RTUEF0012"},
+    {"company": "MNC", "model": "MICRA", "policy_number": "RTUEF0018"},
+    {"company": "MNC", "model": "ALMERA", "policy_number": "RTUEF0017"},
+    {"company": "HAKKI", "model": "S-PRESSO & VITZ", "policy_number": "RTUEF0032"},
+    {"company": "SDI", "model": "DZIRE", "policy_number": "RTUEF0006"},
+    {"company": "BLS", "model": "VITZ", "policy_number": "RTUEF0043"},
+]
 
 YES_TOKENS = {"yes", "y", "yeah", "yep", "affirmative", "sure", "please", "ok", "okay"}
 NO_TOKENS = {"no", "n", "nope", "nah", "fine", "alright", "i'm ok", "im ok", "i am ok", "i'm fine", "im fine"}
@@ -5523,7 +9926,13 @@ NO_TOKENS = {"no", "n", "nope", "nah", "fine", "alright", "i'm ok", "im ok", "i 
 ACCIDENT_REPORT_INTENT = "accident_report"
 CASH_ENABLE_INTENT = "cash_enable_request"
 CASH_BALANCE_UPDATE_INTENT = "cash_balance_update"
+PAYMENT_PLAN_INTENT = "payment_plan_request"
 BRANDING_BONUS_INTENT = "branding_bonus_issue"
+BRANDING_CAMPAIGN_INTENT = "branding_campaign_issue"
+VEHICLE_CATEGORY_INTENT = "vehicle_category_issue"
+SAFETY_INCIDENT_INTENT = "safety_incident"
+ACCOUNT_STATEMENT_INTENT = "account_statement_request"
+ACCOUNT_BALANCE_INTENT = "account_balance_inquiry"
 
 INJURY_POSITIVE_KEYWORDS = [
     "injured",
@@ -5567,6 +9976,29 @@ INJURY_NEGATIVE_KEYWORDS = [
     "i am alright",
     "i'm safe",
     "im safe",
+]
+
+POLICE_POSITIVE_PHRASES = [
+    "police here",
+    "police are here",
+    "police on site",
+    "saps here",
+    "saps are here",
+    "police arrived",
+    "police on scene",
+    "officers here",
+    "cops here",
+]
+POLICE_NEGATIVE_PHRASES = [
+    "no police",
+    "police not here",
+    "police not on site",
+    "police not yet",
+    "waiting for police",
+    "police on the way",
+    "haven't called police",
+    "have not called police",
+    "not yet",
 ]
 
 NO_OTHER_VEHICLE_PHRASES = [
@@ -6031,19 +10463,28 @@ MODEL_TARGETS = {
 
 DEFAULT_TARGETS = {"online_hours": 55, "acceptance_rate": 80, "earnings_per_hour": 140, "gross_earnings": 8000, "trip_count": 110}
 
+TYPO_CORRECTIONS: List[Tuple[Pattern[str], str]] = [
+    (re.compile(r"\bhole\s+night\b", re.IGNORECASE), "whole night"),
+    (re.compile(r"\b(?:acct|accnt|acount|accout)\b", re.IGNORECASE), "account"),
+    (re.compile(r"\bbalnce\b", re.IGNORECASE), "balance"),
+]
+
 def _normalize_model_key(asset_model: str) -> str:
     return (asset_model or "").strip().lower()
 
 def _normalize_text(text: str) -> str:
     if not text:
         return ""
-    return (
+    normalized = (
         text.replace("\u2019", "'")
         .replace("\u2018", "'")
         .replace("\u201c", '"')
         .replace("\u201d", '"')
         .replace("\u00a0", " ")
     )
+    for pattern, replacement in TYPO_CORRECTIONS:
+        normalized = pattern.sub(replacement, normalized)
+    return normalized
 
 FUEL_PRICE_RANDS = float(_env("FUEL_PRICE_RANDS", "21.63") or "21.63")
 MODEL_FUEL_EFFICIENCY_KM_PER_L = {
@@ -6358,12 +10799,81 @@ def _is_accident_message(text: str) -> bool:
     return "accident" in lowered or "crash" in lowered or "collision" in lowered
 
 
+def _is_accident_cancellation(text: str) -> bool:
+    if not text:
+        return False
+    lowered = _normalize_text(text).lower()
+    return any(re.search(pattern, lowered) for pattern in ACCIDENT_CANCEL_PATTERNS)
+
+
+def _normalize_policy_key(value: Optional[str]) -> str:
+    return re.sub(r"[^A-Z0-9]+", "", str(value or "").upper())
+
+
+def _policy_numbers_for_model(model: Optional[str], *, company: Optional[str] = None) -> List[str]:
+    model_key = _normalize_policy_key(model)
+    if not model_key:
+        return []
+    company_key = _normalize_policy_key(company) if company else ""
+    matches: List[Dict[str, str]] = []
+    for entry in ACCIDENT_POLICY_ENTRIES:
+        entry_model_key = _normalize_policy_key(entry.get("model"))
+        if not entry_model_key:
+            continue
+        if model_key == entry_model_key or model_key in entry_model_key or entry_model_key in model_key:
+            matches.append(entry)
+    if company_key:
+        company_matches = [
+            m for m in matches if _normalize_policy_key(m.get("company")) == company_key
+        ]
+        if company_matches:
+            matches = company_matches
+    exact_matches = [m for m in matches if _normalize_policy_key(m.get("model")) == model_key]
+    if exact_matches:
+        matches = exact_matches
+    policy_numbers: List[str] = []
+    seen = set()
+    for match in matches:
+        policy = match.get("policy_number")
+        if policy and policy not in seen:
+            seen.add(policy)
+            policy_numbers.append(policy)
+    return policy_numbers
+
+
+def _policy_number_for_model(model: Optional[str], *, company: Optional[str] = None) -> Optional[str]:
+    numbers = _policy_numbers_for_model(model, company=company)
+    return numbers[0] if numbers else None
+
+
 def _interpret_medical_response(text: str) -> Tuple[Optional[bool], Optional[bool]]:
     if not text:
         return None, None
     lowered = text.lower()
     driver_ok: Optional[bool] = None
     medical_needed: Optional[bool] = None
+
+    if any(word in lowered for word in ["police", "saps", "cop", "cops", "officer", "officers"]):
+        if not any(
+            word in lowered
+            for word in [
+                "injur",
+                "hurt",
+                "bleed",
+                "blood",
+                "pain",
+                "ambulance",
+                "hospital",
+                "paramedic",
+                "doctor",
+                "ok",
+                "okay",
+                "fine",
+                "safe",
+                "alright",
+            ]
+        ):
+            return None, None
 
     if any(phrase in lowered for phrase in INJURY_POSITIVE_KEYWORDS):
         driver_ok = False
@@ -6395,6 +10905,28 @@ def _interpret_medical_response(text: str) -> Tuple[Optional[bool], Optional[boo
         driver_ok = True
 
     return driver_ok, medical_needed
+
+
+def _interpret_police_response(text: str) -> Optional[bool]:
+    if not text:
+        return None
+    lowered = text.lower()
+    if any(phrase in lowered for phrase in POLICE_POSITIVE_PHRASES):
+        return True
+    if any(phrase in lowered for phrase in POLICE_NEGATIVE_PHRASES):
+        return False
+    if any(word in lowered for word in ["police", "saps", "cop", "cops", "officer", "officers"]):
+        if re.search(r"\b(no|not|never|waiting|yet)\b", lowered):
+            return False
+        return True
+    tokens = set(re.findall(r"[a-z']+", lowered))
+    yes_tokens = tokens & YES_TOKENS
+    no_tokens = tokens & NO_TOKENS
+    if yes_tokens and not no_tokens:
+        return True
+    if no_tokens and not yes_tokens:
+        return False
+    return None
 
 
 def _interpret_other_vehicle_response(text: str) -> Optional[bool]:
@@ -6439,6 +10971,119 @@ def _contains_contact_details(text: str) -> bool:
     return False
 
 
+def _extract_license_disk_details(text: str) -> Tuple[Optional[str], Optional[str]]:
+    if not text:
+        return None, None
+    raw = text.strip()
+    if not raw:
+        return None, None
+    lowered = raw.lower()
+    if not any(token in lowered for token in ("model", "make", "company", "owner", "fleet")):
+        return None, None
+    model = None
+    company = None
+    model_match = re.search(
+        r"\b(?:model|make)\b\s*(?:is|:|-)?\s*([A-Za-z0-9 &/\-]{2,}?)(?:\bcompany\b|\bowner\b|\bfleet\b|$)",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if model_match:
+        model = re.sub(r"\s+", " ", model_match.group(1)).strip(" .,:;-")
+    company_match = re.search(
+        r"\b(?:company|owner|fleet)\b\s*(?:is|:|-)?\s*([A-Za-z0-9 &/\-]{2,}?)(?:\bmodel\b|\bmake\b|$)",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if company_match:
+        company = re.sub(r"\s+", " ", company_match.group(1)).strip(" .,:;-")
+
+    if not model:
+        model_after_match = re.search(
+            r"([A-Za-z0-9 &/\-]{2,}?)\s+\b(?:model|make)\b",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if model_after_match:
+            candidate = model_after_match.group(1)
+            model = re.sub(r"\s+", " ", candidate).strip(" .,:;-")
+
+    if not company:
+        company_after_match = re.search(
+            r"([A-Za-z0-9 &/\-]{2,}?)\s+\b(?:company|owner|fleet)\b",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if company_after_match:
+            candidate = company_after_match.group(1)
+            company = re.sub(r"\s+", " ", candidate).strip(" .,:;-")
+
+    return model or None, company or None
+
+
+def _license_disk_guide_path() -> Optional[Path]:
+    if not LICENSE_DISK_GUIDE_IMAGE_PATH:
+        return None
+    guide_path = Path(LICENSE_DISK_GUIDE_IMAGE_PATH).expanduser()
+    if not guide_path.is_absolute():
+        guide_path = (BASE_DIR / guide_path).resolve()
+    return guide_path
+
+
+def _license_disk_guide_available() -> bool:
+    if LICENSE_DISK_GUIDE_IMAGE_URL:
+        return True
+    guide_path = _license_disk_guide_path()
+    return bool(guide_path and guide_path.is_file())
+
+
+def _format_simple_list(items: List[str]) -> str:
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
+
+
+def _accident_required_photo_types(case: Dict[str, Any]) -> List[str]:
+    required = ["damage", "plate", "license_disk", "driver_license"]
+    if case.get("other_vehicle_involved"):
+        required.append("other_driver_license")
+    return required
+
+
+def _accident_missing_photo_types(case: Dict[str, Any]) -> List[str]:
+    missing: List[str] = []
+    for photo_type in _accident_required_photo_types(case):
+        if photo_type == "license_disk":
+            if case.get("license_disk_photo_received") or case.get("license_disk_details_received"):
+                continue
+        state_key = ACCIDENT_PHOTO_STATE_KEYS.get(photo_type)
+        if state_key and not case.get(state_key):
+            missing.append(photo_type)
+    return missing
+
+
+def _accident_photo_type_from_text(text: str, *, other_driver_involved: bool = False) -> Optional[str]:
+    if not text:
+        return None
+    lowered = text.lower()
+    if any(kw in lowered for kw in ACCIDENT_PHOTO_LICENSE_DISK_KEYWORDS):
+        return "license_disk"
+    if any(kw in lowered for kw in ACCIDENT_PHOTO_PLATE_KEYWORDS):
+        return "plate"
+    if any(kw in lowered for kw in ACCIDENT_PHOTO_OTHER_DRIVER_KEYWORDS):
+        return "other_driver_license"
+    if any(kw in lowered for kw in ACCIDENT_PHOTO_LICENSE_KEYWORDS):
+        if "plate" in lowered or "registration" in lowered:
+            return "plate"
+        return "driver_license"
+    if any(kw in lowered for kw in ACCIDENT_PHOTO_DAMAGE_KEYWORDS):
+        return "damage"
+    return None
+
+
 def _looks_like_address(text: str) -> bool:
     if not text:
         return False
@@ -6480,7 +11125,7 @@ AREA_GENERIC_WORDS = {
     "yes", "no", "ok", "okay", "thanks", "thank", "thank you", "hello", "hi",
     "what", "about", "in", "near", "around", "at", "by", "there", "here",
     "is", "are", "your", "name", "who", "this", "please",
-    "hey",
+    "hey", "and", "met", "accident", "accidents",
     "i", "im", "i'm", "am", "me", "my", "mine", "we", "us", "our", "not",
     "a", "an", "the", "to", "from", "into", "onto", "toward", "towards", "via", "for", "of", "on",
     "busy", "busiest", "demand", "hot", "peak", "now", "today", "moment", "currently", "right",
@@ -6575,7 +11220,11 @@ def _extract_low_demand_area_candidates(text: str) -> List[str]:
 def _next_accident_stage(case: Dict[str, Any]) -> str:
     if not case:
         return "safety"
-    if case.get("driver_ok") is None or case.get("medical_needed") is None:
+    if (
+        case.get("driver_ok") is None
+        or case.get("medical_needed") is None
+        or case.get("police_on_site") is None
+    ):
         return "safety"
     if not case.get("location_received"):
         return "location"
@@ -6587,6 +11236,8 @@ def _next_accident_stage(case: Dict[str, Any]) -> str:
             return "vehicle_details"
         if not case.get("other_driver_details"):
             return "other_driver_details"
+    if _accident_missing_photo_types(case):
+        return "photos"
     return "wrapup"
 
 
@@ -6604,10 +11255,13 @@ def _is_balance_dispute(text: str) -> bool:
     if not text:
         return False
     lowered = _normalize_text(text).lower()
-    if not any(term in lowered for term in ["balance", "outstanding", "owe", "amount", "account"]):
+    if not any(term in lowered for term in ["balance", "outstanding", "owe", "amount", "account", "statement", "payment"]):
         return False
     if any(kw in lowered for kw in BALANCE_DISPUTE_KEYWORDS):
         return True
+    if "statement" in lowered and "payment" in lowered:
+        if re.search(r"\b(not|missing|no|doesn't|doesnt|didn't|didnt)\b.*\b(show|reflect|appear|post|posted|posting)\b", lowered):
+            return True
     if re.search(r"\b(do\s*not|don't|dont|not)\s+owe\b", lowered):
         return True
     if re.search(r"\b(balance|outstanding|amount)\b.*\b(wrong|incorrect|not right|not correct|mistake|error)\b", lowered):
@@ -6615,10 +11269,175 @@ def _is_balance_dispute(text: str) -> bool:
     return False
 
 
+ACCOUNT_INFO_KEYWORDS = [
+    "account info",
+    "account details",
+    "account login",
+    "view my account",
+    "account status",
+    "check my account",
+    "account number",
+    "account id",
+]
+
+ACCOUNT_BALANCE_KEYWORDS = [
+    "account balance",
+    "current balance",
+    "my balance",
+    "outstanding balance",
+    "how much do i owe",
+    "what do i owe",
+    "balance please",
+    "amount due",
+    "account due",
+    "what is my balance",
+    "my account balance",
+]
+
+ACCOUNT_LINK_PHRASES = [
+    "account linked",
+    "no driver account",
+    "no account linked",
+    "account not linked",
+    "driver account linked",
+    "driver account not linked",
+    "my driver account",
+]
+
+ACCOUNT_ID_PATTERN = re.compile(r"\baccount\s*(?:id|no|number|#)\b", re.IGNORECASE)
+ACCOUNT_DIGIT_PATTERN = re.compile(r"\b\d{4,18}\b")
+
+SHORT_SLANG_TOKENS = {"lol", "omg", "omfg", "lmao", "rofl", "haha", "hehe", "woah", "yay", "yess", "yass"}
+
+GEO_RESTRICTION_ZONES = {"gauteng", "johannesburg", "pretoria"}
+GEO_RESTRICTION_PATTERN = re.compile(
+    r"\b(?:outside|out\s*of|leave|leaving|cross(?:ing)?|beyond|go(?:ing)?|travel(?:ing)?|take(?:ing)?|drive(?:ing)?|head(?:ing)?\b).*"
+    r"\b(?:gauteng|johannesburg|pretoria)\b",
+    re.IGNORECASE,
+)
+GEO_RESTRICTION_PATTERN_REVERSE = re.compile(
+    r"\b(?:gauteng|johannesburg|pretoria)\b.*\b(?:outside|out\s*of|leave|leaving|cross(?:ing)?|beyond|go(?:ing)?|travel(?:ing)?|take(?:ing)?|drive(?:ing)?|head(?:ing)?)\b",
+    re.IGNORECASE,
+)
+GEO_RESTRICTION_INTENT = "geo_restriction"
+
+def _mentions_account_reference(lowered: str) -> bool:
+    if ACCOUNT_ID_PATTERN.search(lowered):
+        return True
+    if any(phrase in lowered for phrase in ACCOUNT_LINK_PHRASES):
+        return True
+    if "account" in lowered and ACCOUNT_DIGIT_PATTERN.search(lowered):
+        return True
+    return False
+
+def _is_short_slang_message(text: str) -> bool:
+    if not text:
+        return False
+    cleaned = _normalize_text(text).lower().strip()
+    tokens = [tok for tok in re.findall(r"[a-z]+", cleaned) if tok]
+    if not tokens:
+        return False
+    if len(cleaned) > 14:
+        return False
+    if all(tok in SHORT_SLANG_TOKENS for tok in tokens) and len(tokens) <= 3:
+        return True
+    if len(tokens) == 1 and tokens[0] in SHORT_SLANG_TOKENS:
+        return True
+    return False
+
+
+def _is_account_inquiry(text: str) -> bool:
+    if not text:
+        return False
+    if _is_account_balance_inquiry(text) or _is_account_statement_request(text):
+        return False
+    lowered = _normalize_text(text).lower()
+    if any(keyword in lowered for keyword in ACCOUNT_INFO_KEYWORDS):
+        return True
+    return _mentions_account_reference(lowered)
+
+
+ACCOUNT_STATEMENT_KEYWORDS = {
+    "statement",
+    "account statement",
+    "last payment",
+    "invoice",
+    "credit note",
+    "xero",
+}
+
+
+def _is_account_statement_request(text: str) -> bool:
+    if not text:
+        return False
+    lowered = _normalize_text(text).lower()
+    return any(keyword in lowered for keyword in ACCOUNT_STATEMENT_KEYWORDS)
+
+
+def _is_account_balance_inquiry(text: str) -> bool:
+    if not text:
+        return False
+    if _is_account_statement_request(text):
+        return False
+    lowered = _normalize_text(text).lower()
+    return any(keyword in lowered for keyword in ACCOUNT_BALANCE_KEYWORDS)
+
+
+def _is_geo_restriction_query(text: str) -> bool:
+    if not text:
+        return False
+    lowered = _normalize_text(text).lower()
+    if not GEO_RESTRICTION_ZONES & set(re.findall(r"[a-z]+", lowered)):
+        return False
+    if GEO_RESTRICTION_PATTERN.search(lowered) or GEO_RESTRICTION_PATTERN_REVERSE.search(lowered):
+        return True
+    return False
+
+
+def _is_branding_campaign_issue(text: str) -> bool:
+    if not text:
+        return False
+    lowered = _normalize_text(text).lower()
+    if "branding" not in lowered and "campaign" not in lowered:
+        return False
+    if any(kw in lowered for kw in BRANDING_CAMPAIGN_KEYWORDS):
+        return True
+    if "branding" in lowered and re.search(r"\b(not\s+on|off|inactive|missing)\b", lowered):
+        return True
+    if "campaign" in lowered and re.search(r"\b(not\s+on|off|inactive|missing|removed|stopped)\b", lowered):
+        return True
+    return False
+
+
+def _is_vehicle_category_issue(text: str) -> bool:
+    if not text:
+        return False
+    lowered = _normalize_text(text).lower()
+    if any(kw in lowered for kw in VEHICLE_CATEGORY_KEYWORDS):
+        return True
+    if "category" not in lowered:
+        return False
+    if any(tag in lowered for tag in ["bolt", "vehicle", "car", "driver"]):
+        if re.search(r"\b(no|not|wrong|incorrect|missing|change|changed|removed|issue|problem)\b", lowered):
+            return True
+    return False
+
+
+def _is_safety_incident(text: str) -> bool:
+    if not text:
+        return False
+    lowered = _normalize_text(text).lower()
+    return any(kw in lowered for kw in SAFETY_INCIDENT_KEYWORDS)
+
+
 def _is_low_demand_issue(text: str) -> bool:
     if not text:
         return False
     lowered = _normalize_text(text).lower()
+    if _mentions_tow_request(text):
+        return False
+    if _is_accident_message(text) or _is_car_problem(text):
+        return False
     if any(phrase in lowered for phrase in LOW_DEMAND_EXPLICIT_PHRASES):
         return True
     tokens = set(re.findall(r"[a-z']+", lowered))
@@ -6769,6 +11588,10 @@ def _is_no_vehicle(text: str) -> bool:
     lowered = _normalize_text(text).lower()
     if any(kw in lowered for kw in NO_VEHICLE_KEYWORDS):
         return True
+    if re.search(r"\b(waiting|awaiting)\b.*\b(car|vehicle)\b.*\b(fix|fixed|repair|workshop|service|maintenance)\b", lowered):
+        return True
+    if re.search(r"\b(car|vehicle)\b.*\b(still|currently)\b.*\b(workshop|repair|service|maintenance|fix|fixed)\b", lowered):
+        return True
     if re.search(r"\b(no|without)\s+(a|the)?\s*(car|csr|vehicle|taxi|cab)\b", lowered):
         return True
     return bool(re.search(r"\b(do\s*not|don't|dont)\s+(have|got)?\s*(a|the)?\s*(car|csr|vehicle|taxi|cab)\b", lowered))
@@ -6845,6 +11668,457 @@ def _is_car_problem(text: str) -> bool:
         return False
     return any(term in lowered for term in CAR_PROBLEM_SYMPTOM_TERMS)
 
+def _extract_car_drivable_status(text: str) -> Optional[bool]:
+    if not text:
+        return None
+    lowered = _normalize_text(text).lower()
+    if any(phrase in lowered for phrase in CAR_DRIVABLE_NEGATIVE_PHRASES):
+        return False
+    if any(phrase in lowered for phrase in CAR_DRIVABLE_POSITIVE_PHRASES):
+        return True
+    return None
+
+def _is_car_policy_request(text: str) -> bool:
+    if not text:
+        return False
+    lowered = _normalize_text(text).lower()
+    return any(keyword in lowered for keyword in CAR_POLICY_KEYWORDS)
+
+
+def _is_policy_number_question(text: str) -> bool:
+    if not text:
+        return False
+    lowered = _normalize_text(text).lower()
+    return any(phrase in lowered for phrase in POLICY_NUMBER_QUERY_PHRASES)
+
+
+def _policy_license_disk_prompt() -> str:
+    models_hint = "Vitz, S-Presso, Dzire, Bajaj, Almera, Micra"
+    return (
+        f"To spot the company name on the license disk, open {LICENSE_DISK_EXAMPLE_URL} and look for the 'Company' label. "
+        f"Once you send the vehicle model ({models_hint}) and company shown on that disk, I’ll provide the policy number."
+    )
+
+
+def _mentions_tow_request(text: str) -> bool:
+    if not text:
+        return False
+    lowered = _normalize_text(text).lower()
+    return any(keyword in lowered for keyword in ("tow", "towing", "tow truck", "towtruck"))
+
+
+def _is_towing_request(text: str) -> bool:
+    if not text:
+        return False
+    if _mentions_tow_request(text):
+        return True
+    lowered = _normalize_text(text).lower()
+    extra_phrases = [
+        "need tow", "tow me", "tow truck please", "call tow", "tow now", "towing please", "tow service",
+    ]
+    return any(phrase in lowered for phrase in extra_phrases)
+
+
+def _is_tow_arranged_confirmation(text: str) -> bool:
+    if not text:
+        return False
+    normalized = _normalize_text(text)
+    lowered = normalized.lower()
+    if any(phrase in lowered for phrase in TOW_ARRANGED_KEYWORDS):
+        return True
+    if _is_positive_confirmation(text):
+        tokens = set(re.findall(r"[a-z']+", lowered))
+        if "tow" in tokens or "towing" in tokens:
+            return True
+    return False
+
+
+def _towing_reason(text: str) -> Optional[str]:
+    if not text:
+        return None
+    lowered = _normalize_text(text).lower()
+    if re.search(r"\b(workshop|garage|service|maintenance|repair)\b", lowered) and ("tow" in lowered or "towing" in lowered):
+        return "mechanical"
+    if _is_accident_message(text) or any(kw in lowered for kw in ("accident", "crash", "collision")):
+        return "accident"
+    mechanical_markers = [
+        "breakdown",
+        "broke down",
+        "dead battery",
+        "flat battery",
+        "battery died",
+        "stuck",
+        "won't start",
+        "wont start",
+        "cant start",
+        "can't start",
+        "not starting",
+        "not moving",
+        "engine",
+        "gearbox",
+        "flat tyre",
+        "flat tire",
+    ]
+    if any(marker in lowered for marker in mechanical_markers):
+        return "mechanical"
+    if _is_car_problem(text):
+        return "mechanical"
+    return None
+
+
+def _remember_towing_vehicle_info(ctx: Dict[str, Any], model: Optional[str], company: Optional[str]) -> None:
+    if not ctx:
+        return
+    if not model and not company:
+        return
+    info = ctx.setdefault("_towing_vehicle_info", {})
+    if model:
+        info["model"] = model
+    if company:
+        info["company"] = company
+
+
+def _get_towing_vehicle_info(ctx: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    info = ctx.get("_towing_vehicle_info")
+    if not isinstance(info, dict):
+        return None, None
+    return info.get("model"), info.get("company")
+
+
+def _build_towing_reply(
+    reason: Optional[str],
+    ctx: Dict[str, Any],
+    driver: Dict[str, Any],
+    *,
+    vehicle_model: Optional[str] = None,
+    vehicle_company: Optional[str] = None,
+    message: Optional[str] = None,
+) -> str:
+    def _normalize_label(value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        cleaned = str(value).strip()
+        return cleaned or None
+
+    override_model = _normalize_label(vehicle_model)
+    override_company = _normalize_label(vehicle_company)
+    message_model, message_company = _extract_license_disk_details(message or "")
+    saved_model, saved_company = _get_towing_vehicle_info(ctx)
+    driver_model = _normalize_label(driver.get("asset_model") or driver.get("model"))
+    driver_company = _normalize_label(driver.get("company"))
+    if override_model or override_company:
+        _remember_towing_vehicle_info(ctx, override_model, override_company)
+    if message_model or message_company:
+        _remember_towing_vehicle_info(ctx, message_model, message_company)
+    final_model = override_model or saved_model or driver_model
+    final_company = override_company or saved_company or driver_company
+    if message_model or message_company:
+        final_model = message_model or final_model
+        final_company = message_company or final_company
+    towing_line, policy_number = _build_car_towing_line(
+        vehicle_model=final_model,
+        vehicle_company=final_company,
+    )
+    ctx["_towing_request_reason"] = reason or "unknown"
+    ctx["_towing_request_sent"] = True
+    if not towing_line:
+        towing_line = f"If you need towing, call {ACCIDENT_TOWING_NUMBER}."
+    policy_query = bool(message and _is_policy_number_question(message))
+    awaiting_policy_details = bool(ctx.get("_awaiting_policy_number_details"))
+    if (policy_query or awaiting_policy_details) and policy_number and final_model and final_company:
+        vehicle_label = f"{final_company} {final_model}".strip()
+        ctx.pop("_awaiting_policy_number_details", None)
+        return (
+            f"Policy number {policy_number} for your {vehicle_label}. "
+            f"Call {ACCIDENT_TOWING_NUMBER} and quote it for towing."
+        )
+
+    if reason == "accident":
+        parts = [
+            "I’m really sorry about the accident.",
+            "First make sure everyone is safe and call 112 if anyone needs urgent help.",
+            "Share a location pin, a short note about what happened, and any damage photos so ops can dispatch towing.",
+            towing_line,
+        ]
+    elif reason == "mechanical":
+        parts = [
+            "It sounds like a mechanical breakdown.",
+            "Please describe what happened, share your location or a pin, and let me know if the car can’t move so ops can send a tow truck.",
+            towing_line,
+        ]
+    else:
+        parts = [
+            "I can help get towing arranged.",
+            "Could you confirm if this is a breakdown or an accident, and share your location plus any photos so ops can send the right support?",
+            towing_line,
+        ]
+    return " ".join(part for part in parts if part)
+
+def _extract_workshop_reference(text: str) -> Optional[str]:
+    if not text:
+        return None
+    raw = text.strip()
+    lowered = raw.lower()
+    normalized = re.sub(r"[^a-z0-9]+", "", lowered)
+    for key, label in KNOWN_WORKSHOP_NAMES.items():
+        if key in lowered:
+            return label
+        compact_key = re.sub(r"[^a-z0-9]+", "", key)
+        if compact_key and compact_key in normalized:
+            return label
+    for pattern in WORKSHOP_TRAVEL_PATTERNS:
+        match = re.search(pattern, raw, flags=re.IGNORECASE)
+        if match:
+            dest = match.group(1).strip()
+            dest = re.sub(r"[.?!]+$", "", dest).strip()
+            dest_clean = re.sub(r"\b(workshop|garage|mechanic|service|maintenance|repair)\b", "", dest, flags=re.IGNORECASE).strip()
+            if dest_clean:
+                return dest_clean
+            if dest:
+                return dest
+    if any(kw in lowered for kw in WORKSHOP_LOCATION_KEYWORDS):
+        return "workshop"
+    return None
+
+def _is_workshop_destination_question(text: str) -> bool:
+    if not text:
+        return False
+    lowered = _normalize_text(text).lower()
+    for pattern in WORKSHOP_DESTINATION_QUESTION_PATTERNS:
+        if re.search(pattern, lowered):
+            return True
+    return False
+
+def _coerce_workshop_entry(value: Any) -> Optional[Dict[str, str]]:
+    if not value:
+        return None
+    if isinstance(value, str):
+        name = value.strip()
+        return {"name": name} if name else None
+    if isinstance(value, dict):
+        name = str(value.get("name") or value.get("label") or value.get("workshop") or "").strip()
+        if not name:
+            return None
+        address = str(value.get("address") or value.get("location") or "").strip()
+        entry = {"name": name}
+        if address:
+            entry["address"] = address
+        return entry
+    return None
+
+def _lookup_workshop_for_model(asset_model: Optional[str]) -> Optional[Dict[str, str]]:
+    key = _normalize_model_key(asset_model or "")
+    if key:
+        for model_key, entry in MODEL_WORKSHOP_MAP.items():
+            if model_key in key:
+                return _coerce_workshop_entry(entry)
+    if DEFAULT_WORKSHOP_NAME:
+        entry = {"name": DEFAULT_WORKSHOP_NAME}
+        if DEFAULT_WORKSHOP_ADDRESS:
+            entry["address"] = DEFAULT_WORKSHOP_ADDRESS
+        return entry
+    return None
+
+def _format_workshop_label(entry: Optional[Dict[str, str]]) -> Optional[str]:
+    if not entry or not entry.get("name"):
+        return None
+    name = entry["name"]
+    address = entry.get("address") or ""
+    if address:
+        return f"{name} ({address})"
+    return name
+
+def _build_car_towing_line(
+    *,
+    vehicle_model: Optional[str],
+    vehicle_company: Optional[str] = None,
+    vehicle_registration: Optional[str] = None,
+) -> Tuple[str, Optional[str]]:
+    policy_number = None
+    if vehicle_model and vehicle_company:
+        policy_numbers = _policy_numbers_for_model(vehicle_model, company=vehicle_company)
+        if policy_numbers:
+            policy_number = policy_numbers[0]
+    vehicle_bits = [bit for bit in [vehicle_company, vehicle_model] if bit]
+    vehicle_label = " ".join(vehicle_bits).strip()
+    if policy_number:
+        reg_clause = (
+            f" with vehicle registration {vehicle_registration}"
+            if vehicle_registration
+            else " with your vehicle registration"
+        )
+        policy_clause = f" and policy number {policy_number}"
+        label_clause = f" for your {vehicle_label}" if vehicle_label else ""
+        line = (
+            f"If you need towing, call {ACCIDENT_TOWING_NUMBER}{reg_clause}{policy_clause}{label_clause}."
+        )
+    return line, policy_number
+
+    reg_clause = (
+        f" with vehicle registration {vehicle_registration}"
+        if vehicle_registration
+        else " with your vehicle registration"
+    )
+    line = f"If you need towing, call {ACCIDENT_TOWING_NUMBER}{reg_clause}."
+    if vehicle_model and vehicle_company:
+        line += f" I can confirm the policy number for your {vehicle_company} {vehicle_model} if needed."
+    else:
+        missing_parts: List[str] = []
+        if not vehicle_company:
+            missing_parts.append("company")
+        if not vehicle_model:
+            missing_parts.append("vehicle model")
+        if missing_parts:
+            if len(missing_parts) == 2:
+                detail_text = "vehicle model and company"
+            else:
+                detail_text = missing_parts[0]
+            line += f" Reply with the {detail_text} shown on the license disk if you need the policy number."
+        else:
+            line += " Reply with the vehicle model and company shown on the license disk if you need the policy number."
+    return line, None
+
+
+def _towing_followup_text(
+    *,
+    vehicle_label: Optional[str],
+    vehicle_registration: Optional[str],
+    policy_number: Optional[str],
+) -> str:
+    parts: List[str] = ["Just checking if you managed to arrange the tow."]
+    call_clause = f"Call {ACCIDENT_TOWING_NUMBER}"
+    reg_part = (
+        f" with vehicle registration {vehicle_registration}"
+        if vehicle_registration
+        else " with your vehicle registration"
+    )
+    call_clause += reg_part
+    if policy_number:
+        call_clause += f" and policy number {policy_number}"
+    else:
+        call_clause += " and mention the policy number once you have it"
+    if vehicle_label:
+        call_clause += f" for your {vehicle_label}"
+    parts.append(f"{call_clause}.")
+    parts.append("Please reply once it's sorted or if you still need help.")
+    return " ".join(parts)
+
+
+def _schedule_towing_followup(
+    *,
+    wa_id: str,
+    ticket_id: Optional[int],
+    vehicle_label: Optional[str],
+    vehicle_registration: Optional[str],
+    policy_number: Optional[str],
+) -> None:
+    if not wa_id or not ticket_id:
+        return
+
+    def _send_followup() -> None:
+        ctx = load_context_file(wa_id)
+        if ctx.get("_towing_followup_sent_at"):
+            return
+        if ticket_id:
+            ticket = fetch_driver_issue_ticket(ticket_id)
+            if ticket and _is_ticket_status_closed(ticket.get("status")):
+                return
+        body = _towing_followup_text(
+            vehicle_label=vehicle_label,
+            vehicle_registration=vehicle_registration,
+            policy_number=policy_number,
+        )
+        if not body:
+            return
+        outbound_id = send_whatsapp_text(wa_id, body)
+        status = "sent" if outbound_id else "send_failed"
+        timestamp_unix = str(int(time.time()))
+        log_message(
+            direction="OUTBOUND",
+            wa_id=wa_id,
+            text=body,
+            intent="car_problem",
+            status=status,
+            wa_message_id=outbound_id,
+            message_id=outbound_id,
+            business_number=None,
+            phone_number_id=None,
+            origin_type="towing_followup",
+            raw_json={"ticket_id": ticket_id, "followup": True},
+            timestamp_unix=timestamp_unix,
+            sentiment=None,
+            sentiment_score=None,
+            intent_label="car_problem",
+            ai_raw=None,
+            conversation_id=f"towing-followup-{ticket_id}",
+        )
+        if outbound_id:
+            ctx["_towing_followup_sent_at"] = time.time()
+            ctx["_towing_followup_message_id"] = outbound_id
+            save_context_file(wa_id, ctx)
+
+    timer = threading.Timer(TOWING_FOLLOWUP_DELAY_SECONDS, _send_followup)
+    timer.daemon = True
+    timer.start()
+
+def _build_car_drivable_line(
+    drivable_status: Optional[bool],
+    *,
+    workshop_label: Optional[str],
+    vehicle_model: Optional[str],
+    question: bool = False,
+) -> Optional[str]:
+    model_bit = ""
+    if vehicle_model:
+        if not (workshop_label and vehicle_model.lower() in workshop_label.lower()):
+            model_bit = f" for your {vehicle_model}"
+    if drivable_status is True:
+        if workshop_label:
+            return f"Since it's drivable, please head to {workshop_label}{model_bit}."
+        return "Since it's drivable, please head to your nearest approved workshop and tell me where you're going."
+    if drivable_status is False:
+        return "Please park safely and do not drive it."
+    if drivable_status is None and question:
+        if workshop_label:
+            return (
+                f"Can you still drive the car? If yes, please head to {workshop_label}{model_bit}. "
+                "If not, park safely and share your location."
+            )
+        return "Can you still drive the car? If yes, tell me the workshop or branch you can reach. If not, park safely and share your location."
+    return None
+
+def _build_car_ticket_metadata_patch(
+    *,
+    msg: str,
+    drivable_status: Optional[bool],
+    workshop_ref: Optional[str],
+    workshop_source: Optional[str],
+    vehicle_model: Optional[str],
+    vehicle_company: Optional[str] = None,
+    policy_number: Optional[str] = None,
+    workshop_info: Optional[Dict[str, str]],
+) -> Dict[str, Any]:
+    patch: Dict[str, Any] = {}
+    if vehicle_model:
+        patch["vehicle_model"] = vehicle_model
+    if vehicle_company:
+        patch["vehicle_company"] = vehicle_company
+    if policy_number:
+        patch["policy_number"] = policy_number
+    if drivable_status is not None:
+        patch["car_drivable"] = bool(drivable_status)
+    if workshop_ref:
+        patch["workshop_reference"] = workshop_ref
+    if workshop_source:
+        patch["workshop_reference_source"] = workshop_source
+    if workshop_info and workshop_info.get("address"):
+        patch["workshop_address"] = workshop_info["address"]
+    if msg:
+        patch["driver_update_text"] = msg.strip()
+    if patch:
+        patch["details_received_at"] = jhb_now().strftime("%Y-%m-%d %H:%M:%S")
+    return patch
+
 def _is_car_resolution_message(text: str) -> bool:
     if not text:
         return False
@@ -6868,6 +12142,40 @@ def _is_negative_confirmation(text: str) -> bool:
     lowered = text.lower().strip()
     tokens = set(re.findall(r"[a-z']+", lowered))
     return bool(tokens & NO_TOKENS)
+
+def _is_car_ticket_followup(text: str, ctx: Dict[str, Any]) -> bool:
+    if not text or not ctx:
+        return False
+    accident_ctx = ctx.get("_accident_case")
+    if isinstance(accident_ctx, dict) and accident_ctx.get("status") in {"collecting", "pending_ops"}:
+        if not accident_ctx.get("closed"):
+            return False
+    ticket_ctx = ctx.get("_car_ticket")
+    if not (isinstance(ticket_ctx, dict) and ticket_ctx.get("status") in {"collecting", "pending_ops"}):
+        return False
+    if ticket_ctx.get("closed"):
+        return False
+    confirm_ctx = ctx.get("_car_confirm_close")
+    if isinstance(confirm_ctx, dict) and confirm_ctx.get("awaiting"):
+        return True
+    if _is_car_problem(text):
+        return True
+    if _is_car_policy_request(text):
+        return True
+    if _extract_car_drivable_status(text) is not None:
+        return True
+    disk_model, disk_company = _extract_license_disk_details(text)
+    if disk_model or disk_company:
+        return True
+    if _is_workshop_destination_question(text) or _extract_workshop_reference(text):
+        return True
+    if _looks_like_address(text):
+        return True
+    if _is_car_resolution_message(text):
+        return True
+    if _is_positive_confirmation(text) or _is_negative_confirmation(text):
+        return True
+    return False
 
 INTRADAY_OPT_IN_KEYWORDS = [
     "daily update",
@@ -6923,6 +12231,16 @@ GLOBAL_OPT_IN_KEYWORDS = [
     "contact me",
 ]
 
+def _clear_global_opt_out_state(ctx: Dict[str, Any]) -> None:
+    ctx.pop("_global_opt_out", None)
+    ctx.pop("_global_opt_out_at", None)
+    ctx["_engagement_followup_paused"] = False
+    ctx.pop("_engagement_followup_paused_at", None)
+    ctx["_intraday_updates_enabled"] = True
+    ctx["_intraday_updates_paused"] = False
+    ctx.pop("_intraday_updates_paused_at", None)
+
+
 def _is_global_opt_out(text: str) -> bool:
     if not text:
         return False
@@ -6934,6 +12252,18 @@ def _is_global_opt_in(text: str) -> bool:
         return False
     lowered = text.lower().strip()
     return any(kw in lowered for kw in GLOBAL_OPT_IN_KEYWORDS)
+
+
+def _maybe_auto_reactivate(ctx: Dict[str, Any], msg: str) -> bool:
+    if not isinstance(ctx, dict):
+        return False
+    if not ctx.get("_global_opt_out"):
+        return False
+    if _is_global_opt_out(msg):
+        return False
+    _clear_global_opt_out_state(ctx)
+    ctx["_global_opt_out_auto_reactivated_at"] = time.time()
+    return True
 
 PEAK_TIME_PATTERNS = [
     r"\bpeak\s+time(s)?\b",
@@ -8754,6 +14084,23 @@ def _is_missing_kpi_reason(reason: Optional[str]) -> bool:
     ]
     return any(token in r for token in tokens)
 
+
+DRIVER_ACCOUNT_ISSUE_TOKENS = [
+    "no driver_kpi_summary records matched",
+    "no driver matched",
+    "no driver identifiers available",
+    "no driver matched the provided identifiers",
+    "no linked contact",
+    "no driver account linked",
+]
+
+
+def _is_driver_account_issue_reason(reason: Optional[str]) -> bool:
+    if not reason:
+        return False
+    lowered = reason.lower()
+    return any(token in lowered for token in DRIVER_ACCOUNT_ISSUE_TOKENS)
+
 def _kpi_no_trips_commitment_message(targets: Dict[str, float]) -> str:
     hours_target = targets.get("online_hours") or ENGAGEMENT_TARGET_ONLINE_HOURS_MIN
     trips_target = targets.get("trip_count") or ENGAGEMENT_TARGET_TRIPS
@@ -8819,6 +14166,19 @@ def _pretty_reason(reason: Optional[str]) -> Optional[str]:
             return f"there were no Bolt trips captured {pretty_suffix}"
         return "there were no Bolt trips captured today"
     return reason
+
+
+def _log_driver_account_lookup_issue(wa_id: str, driver: Dict[str, Any], reason: str) -> None:
+    driver_id = driver.get("driver_id") or driver.get("bolt_driver_id") or "unknown"
+    contacts = driver.get("xero_contact_ids") or []
+    contacts_display = ",".join(str(cid) for cid in contacts if cid) or "none"
+    log.warning(
+        "Driver account lookup failed (wa_id=%s driver_id=%s contacts=%s): %s",
+        wa_id or "unknown",
+        driver_id,
+        contacts_display,
+        reason,
+    )
 
 
 def _compose_kpi_ai_reply(
@@ -8945,7 +14305,7 @@ def _compose_llm_fallback_reply(
     if hotspots:
         context_notes["hotspots"] = hotspots[:3]
 
-    login_url = "https://60b9b868ac0b.ngrok-free.app/driver/login"
+    login_url = "mynextcar.ngrok.io/driver/login"
     prompt = (
         f"Driver first name: {name or 'Driver'}\n"
         f"User message: {msg}\n"
@@ -9070,21 +14430,21 @@ def _format_area_oph_sentence(
         for entry in area_oph[:3]:
             name = entry.get("area")
             oph = entry.get("oph")
-            oph_display = entry.get("oph_display") or (f\"{oph:.1f}\" if oph is not None else None)
+            oph_display = entry.get("oph_display") or (f"{oph:.1f}" if oph is not None else None)
             if not name or not oph_display:
                 continue
             quality = _oph_quality_label(oph)
-            bits.append(f\"{name} {oph_display} OPH ({quality})\")
+            bits.append(f"{name} {oph_display} OPH ({quality})")
         if bits:
-            return f\"OPH {label} by area: \" + \", \".join(bits) + \".\"
+            return f"OPH {label} by area: " + ", ".join(bits) + "."
     if area_oph_reason and requested:
-        req = \", \".join([r for r in requested[:3] if r])
+        req = ", ".join([r for r in requested[:3] if r])
         if req:
             pretty = _pretty_reason(area_oph_reason) or area_oph_reason
-            return f\"I couldn't pull OPH for {req} because {pretty}. Want me to check another area?\"
+            return f"I couldn't pull OPH for {req} because {pretty}. Want me to check another area?"
     if area_oph_reason and not requested:
         pretty = _pretty_reason(area_oph_reason) or area_oph_reason
-        return f\"I couldn't pull OPH for that area because {pretty}. Want me to check another area?\"
+        return f"I couldn't pull OPH for that area because {pretty}. Want me to check another area?"
     return ""
 
 
@@ -9236,7 +14596,7 @@ def render_kpi_reply(
         if finished is not None:
             diff = int(target_by) - finished
             shortfall_daily = max(int(INTRADAY_DAILY_MIN_FINISHED_ORDERS) - finished, 0)
-            praise_hours = {10, 12, 14, 18}
+            praise_hours = {12, 18}
             if diff <= 0:
                 praise = "Well done! " if slot_hour in praise_hours else ""
                 status_line = f"{praise}You’re at {finished} now—on pace."
@@ -9869,6 +15229,155 @@ def upload_whatsapp_media(file: UploadFile) -> Optional[str]:
         return None
 
 
+def upload_whatsapp_media_path(path: Path) -> Optional[str]:
+    if not (WABA_TOKEN and WABA_PHONE_ID):
+        log.warning("Skipping media upload — WABA creds missing.")
+        return None
+    if not path or not path.exists():
+        log.warning("Media upload failed: %s not found.", path)
+        return None
+    try:
+        content = path.read_bytes()
+    except Exception as exc:
+        log.error("Media read failed: %s", exc)
+        return None
+    if not content:
+        return None
+    if len(content) > 10 * 1024 * 1024:  # 10 MB cap
+        log.warning("Media too large to upload (>10MB)")
+        return None
+    content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    media_endpoint = f"https://graph.facebook.com/v19.0/{WABA_PHONE_ID}/media"
+    headers = {"Authorization": f"Bearer {WABA_TOKEN}"}
+    files = {"file": (path.name, content, content_type)}
+    data = {"messaging_product": "whatsapp"}
+    try:
+        resp = requests.post(media_endpoint, headers=headers, files=files, data=data, timeout=30)
+    except Exception as exc:
+        log.error("Media upload failed: %s", exc)
+        return None
+    if resp.status_code != 200:
+        log.error("Media upload failed: %s %s", resp.status_code, resp.text)
+        return None
+    try:
+        return resp.json().get("id")
+    except Exception:
+        return None
+
+
+def send_whatsapp_image(
+    wa_id: str,
+    *,
+    image_url: Optional[str] = None,
+    image_id: Optional[str] = None,
+    caption: Optional[str] = None,
+) -> Optional[str]:
+    if not (WABA_TOKEN and WABA_PHONE_ID):
+        log.warning("Skipping send — WABA creds missing.")
+        return None
+    if not image_url and not image_id:
+        return None
+    headers = {"Authorization": f"Bearer {WABA_TOKEN}", "Content-Type": "application/json"}
+    image_payload: Dict[str, Any] = {"link": image_url} if image_url else {"id": image_id}
+    if caption:
+        image_payload["caption"] = caption
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": wa_id,
+        "type": "image",
+        "image": image_payload,
+    }
+    try:
+        r = requests.post(GRAPH_URL, headers=headers, json=payload, timeout=30)
+    except requests.RequestException as exc:
+        log.error("WA send request failed: %s", exc)
+        return None
+    try:
+        data = r.json()
+    except Exception:
+        data = {}
+    if r.status_code != 200:
+        log.error("WA send failed: %s %s", r.status_code, r.text)
+        return None
+    log.info("✅ WhatsApp API: %s image sent.", r.status_code)
+    try:
+        return data.get("messages", [{}])[0].get("id")
+    except Exception:
+        return None
+
+
+def _maybe_send_license_disk_guide(
+    *,
+    wa_id: str,
+    ctx: Dict[str, Any],
+    conversation_id: Optional[str],
+    business_number: Optional[str],
+    phone_number_id: Optional[str],
+    origin_type: Optional[str],
+) -> bool:
+    ticket_ctx = ctx.get("_car_ticket") if isinstance(ctx.get("_car_ticket"), dict) else None
+    if not (wa_id and ticket_ctx):
+        return False
+    if not ticket_ctx.get("_license_disk_guide_pending"):
+        return False
+    if ticket_ctx.get("_license_disk_guide_sent"):
+        ticket_ctx.pop("_license_disk_guide_pending", None)
+        return True
+    if not _license_disk_guide_available():
+        ticket_ctx.pop("_license_disk_guide_pending", None)
+        return True
+    caption = LICENSE_DISK_GUIDE_IMAGE_CAPTION or ""
+    media_url = LICENSE_DISK_GUIDE_IMAGE_URL or ""
+    media_id = None
+    if not media_url:
+        guide_path = _license_disk_guide_path()
+        if guide_path and guide_path.is_file():
+            media_id = upload_whatsapp_media_path(guide_path)
+    outbound_id = send_whatsapp_image(
+        wa_id,
+        image_url=media_url or None,
+        image_id=media_id,
+        caption=caption or None,
+    )
+    if outbound_id:
+        ticket_ctx["_license_disk_guide_sent"] = True
+        ticket_ctx.pop("_license_disk_guide_pending", None)
+        log_message(
+            direction="OUTBOUND",
+            wa_id=wa_id,
+            text=caption or "[license disk guide image]",
+            intent="car_problem",
+            status="sent",
+            wa_message_id=outbound_id,
+            message_id=outbound_id,
+            business_number=business_number,
+            phone_number_id=phone_number_id,
+            origin_type=origin_type or "whatsapp",
+            media_url=media_url or None,
+            raw_json={"license_disk_guide": True},
+            timestamp_unix=str(int(time.time())),
+            conversation_id=conversation_id,
+        )
+        return True
+    log_message(
+        direction="OUTBOUND",
+        wa_id=wa_id,
+        text=caption or "[license disk guide image]",
+        intent="car_problem",
+        status="send_failed",
+        wa_message_id=None,
+        message_id=None,
+        business_number=business_number,
+        phone_number_id=phone_number_id,
+        origin_type=origin_type or "whatsapp",
+        media_url=media_url or None,
+        raw_json={"license_disk_guide": True, "error": "send_failed"},
+        timestamp_unix=str(int(time.time())),
+        conversation_id=conversation_id,
+    )
+    return False
+
+
 def send_whatsapp_template(
     wa_id: str,
     template_name: str,
@@ -10081,6 +15590,13 @@ def detect_intent(text: str, ctx: Optional[Dict[str, Any]] = None) -> str:
     awaiting_repossession = pending == PENDING_REPOSSESSION_REASON
     awaiting_no_vehicle = pending == PENDING_NO_VEHICLE_REASON
     awaiting_target_update = bool(ctx.get("_awaiting_target_update"))
+    awaiting_medical = bool(
+        ctx.get("_medical_pending_decision")
+        or ctx.get("_medical_pending_commitment")
+        or ctx.get("_medical_pending_location")
+        or ctx.get("_medical_pending_certificate")
+        or ctx.get("_medical_commitment_pending_unit")
+    )
     accident_ctx = ctx.get("_accident_case") if isinstance(ctx.get("_accident_case"), dict) else None
     accident_status = accident_ctx.get("status") if accident_ctx else None
     accident_awaiting = accident_ctx.get("awaiting") if accident_ctx else None
@@ -10092,6 +15608,8 @@ def detect_intent(text: str, ctx: Optional[Dict[str, Any]] = None) -> str:
         and not cash_ticket_ctx.get("closed")
         and cash_ticket_ctx.get("awaiting_pop", True)
     )
+    bonus_ctx = ctx.get("_branding_bonus") if isinstance(ctx.get("_branding_bonus"), dict) else None
+    bonus_awaiting = bonus_ctx.get("awaiting") if bonus_ctx else None
 
     text = _normalize_text(text or "")
     raw = text.strip()
@@ -10099,11 +15617,17 @@ def detect_intent(text: str, ctx: Optional[Dict[str, Any]] = None) -> str:
     if not lowered:
         if awaiting_projection:
             return "earnings_projection"
+        if awaiting_medical:
+            return "medical_issue"
         if accident_waiting:
             return ACCIDENT_REPORT_INTENT
         if cash_waiting:
             return CASH_BALANCE_UPDATE_INTENT
         return "unknown"
+
+    tow_reason = _towing_reason(raw)
+    if tow_reason == "mechanical":
+        return "car_problem"
 
     if _is_global_opt_out(raw):
         return "opt_out"
@@ -10122,8 +15646,20 @@ def detect_intent(text: str, ctx: Optional[Dict[str, Any]] = None) -> str:
         return "account_suspension"
     if _is_app_issue(raw):
         return "app_issue"
+    if _is_branding_campaign_issue(raw):
+        return BRANDING_CAMPAIGN_INTENT
+    if _is_vehicle_category_issue(raw):
+        return VEHICLE_CATEGORY_INTENT
+    if _is_safety_incident(raw):
+        return SAFETY_INCIDENT_INTENT
+    if tow_reason == "accident":
+        return ACCIDENT_REPORT_INTENT
+    if _is_accident_message(raw):
+        return ACCIDENT_REPORT_INTENT
     if _is_balance_dispute(raw):
         return "balance_dispute"
+    if _mentions_tow_request(raw):
+        return ACCIDENT_REPORT_INTENT
     if _is_low_demand_issue(raw):
         return "low_demand"
     if _is_hotspot_query(raw):
@@ -10132,14 +15668,29 @@ def detect_intent(text: str, ctx: Optional[Dict[str, Any]] = None) -> str:
     if _is_vehicle_back(raw) and not _is_no_vehicle(raw):
         return "vehicle_back"
 
-    if ctx.get("_medical_pending_location"):
+    if bonus_awaiting:
+        return BRANDING_BONUS_INTENT
+
+    if awaiting_medical:
+        if any(kw in lowered for kw in BRANDING_BONUS_KEYWORDS):
+            return BRANDING_BONUS_INTENT
         return "medical_issue"
     if ctx.get("_no_vehicle_pending"):
         return "no_vehicle"
     if ctx.get("_balance_dispute_pending"):
         return "balance_dispute"
+    drivable_status = _extract_car_drivable_status(raw)
+    if (drivable_status is not None and ("car" in lowered or "vehicle" in lowered)) or _is_car_problem(raw):
+        return "car_problem"
     if ctx.get("_low_demand_pending"):
         return "low_demand"
+    if _is_ticket_request(raw):
+        if (
+            ctx.get("_low_demand_ticket")
+            or ctx.get("_low_demand_areas")
+            or (ctx.get("_active_concern") or {}).get("type") == "low_demand"
+        ):
+            return "low_demand"
     area_followup = _extract_area_candidates(raw)
     if ctx.get("_low_demand_ticket") and area_followup:
         return "low_demand"
@@ -10219,6 +15770,9 @@ def detect_intent(text: str, ctx: Optional[Dict[str, Any]] = None) -> str:
     if "acceptance" in lowered:
         return "acceptance_rate_status"
 
+    if _is_payment_plan_request(raw):
+        return PAYMENT_PLAN_INTENT
+
     if _is_schedule_update(raw):
         return "schedule_update"
 
@@ -10235,6 +15789,9 @@ def detect_intent(text: str, ctx: Optional[Dict[str, Any]] = None) -> str:
 
     if any(kw in lowered for kw in CASH_ENABLE_KEYWORDS):
         return CASH_ENABLE_INTENT
+
+    if re.search(r"\b(can|will|gonna|going to|able to|able)\s+(to\s+)?pay\b", lowered):
+        return CASH_BALANCE_UPDATE_INTENT
 
     if any(kw in lowered for kw in CASH_BALANCE_UPDATE_KEYWORDS):
         return CASH_BALANCE_UPDATE_INTENT
@@ -10257,6 +15814,10 @@ def detect_intent(text: str, ctx: Optional[Dict[str, Any]] = None) -> str:
     if _is_car_problem(raw):
         return "car_problem"
 
+    issue_match = _match_issue_keywords(raw)
+    if issue_match:
+        return issue_match
+
     if any(kw in lowered for kw in CONCERN_GENERAL_KEYWORDS):
         return "raise_concern"
 
@@ -10267,6 +15828,12 @@ def detect_intent(text: str, ctx: Optional[Dict[str, Any]] = None) -> str:
     if kpi_match:
         return kpi_match
 
+    if _is_short_slang_message(raw):
+        return "smalltalk"
+
+    if _is_geo_restriction_query(raw):
+        return GEO_RESTRICTION_INTENT
+
     if re.search(r"\bhow\s+are\s+(you|u)\b", lowered) or "how are you today" in lowered or "how you doing" in lowered:
         return "smalltalk"
     if any(k in lowered for k in ["what is the date","date today","today's date","current date"]): return "current_date"
@@ -10274,9 +15841,11 @@ def detect_intent(text: str, ctx: Optional[Dict[str, Any]] = None) -> str:
 
     if _is_greeting_message(text):
         return "greeting"
-    if any(k in lowered for k in ["account balance","current balance","my balance","outstanding balance",
-                            "how much do i owe","what do i owe","balance please","amount due",
-                            "account due","what is my balance","my account balance"]):
+    if _is_account_statement_request(raw):
+        return ACCOUNT_STATEMENT_INTENT
+    if _is_account_balance_inquiry(raw):
+        return ACCOUNT_BALANCE_INTENT
+    if _is_account_inquiry(raw):
         return "account_inquiry"
     return "unknown"
 
@@ -12613,6 +18182,173 @@ def _pick_statement_account_sync(
             pass
 
 
+def _account_statement_candidates_from_driver(driver: Dict[str, Any]) -> List[str]:
+    if not driver:
+        return []
+    candidates: List[str] = []
+    seen: set[str] = set()
+
+    def add_candidate(value: Any) -> None:
+        if value is None:
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                add_candidate(item)
+            return
+        cleaned = str(value).strip()
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            candidates.append(cleaned)
+
+    for key in ("account_id", "xero_contact_id", "contact_id"):
+        add_candidate(driver.get(key))
+    add_candidate(driver.get("xero_contact_ids"))
+    add_candidate(driver.get("contact_ids"))
+    return candidates
+
+
+def _latest_statement_entry(rows: List[Dict[str, Any]], source: str) -> Tuple[Optional[Dict[str, Any]], Optional[datetime]]:
+    best: Optional[Dict[str, Any]] = None
+    best_ts: Optional[datetime] = None
+    target = (source or "").strip().lower()
+    if not target:
+        return None, None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        src = str(row.get("source") or "").strip().lower()
+        if src != target:
+            continue
+        ts = _parse_log_timestamp(row.get("date"))
+        if ts is None:
+            continue
+        if best_ts is None or ts > best_ts:
+            best = row
+            best_ts = ts
+    return best, best_ts
+
+
+def _format_account_summary_line(summary: Dict[str, Any]) -> Optional[str]:
+    if not summary:
+        return None
+    events = summary.get("events") or []
+    if not events:
+        return None
+    parts: List[str] = []
+    for event in events:
+        ref = event.get("reference") or event.get("type") or ""
+        date_label = event.get("date_label") or ""
+        amount_val = event.get("amount")
+        amount_text = fmt_rands(amount_val) if amount_val is not None else None
+        line = ref
+        if amount_text:
+            line = f"{line} {amount_text}"
+        if date_label:
+            line = f"{line} on {date_label}"
+        line = line.strip()
+        if not line:
+            continue
+        parts.append(f"{event.get('type') or 'Record'} {line}")
+    return "; ".join(parts) if parts else None
+
+
+def _compose_account_statement_body(
+    ctx: Dict[str, Any],
+    driver: Dict[str, Any],
+    template_amount: Optional[str],
+) -> str:
+    login_url = "mynextcar.ngrok.io/driver/login"
+    summary = _build_account_inquiry_summary(driver)
+    summary_line = _format_account_summary_line(summary)
+    prefix = ""
+    if template_amount:
+        prefix = f"The outstanding balance I mentioned is {template_amount}. "
+    if summary_line:
+        prefix += f"Latest records: {summary_line}. "
+    body = (
+        f"{prefix}For the latest balance, please log in here: {login_url}. "
+        "Use your personal code (South African ID number, or Traffic Registration Number (TRN) for foreign nationals from your PrDP)."
+    )
+    ctx.pop("_account_statement_requested", None)
+    ctx["_awaiting_personal_code"] = False
+    ctx["_personal_code_confirmed"] = False
+    return body
+
+
+def _build_account_inquiry_summary(driver: Dict[str, Any], *, limit: int = 25) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {}
+    if not mysql_available():
+        return summary
+    candidates = _account_statement_candidates_from_driver(driver or {})
+    if not candidates:
+        return summary
+    try:
+        account_id, rows, error = _pick_statement_account_sync(candidates, limit)
+    except Exception as exc:
+        log.debug("account inquiry statement fetch failed: %s", exc)
+        return summary
+    summary["account_id"] = account_id
+    if error:
+        summary["error"] = error
+    if not rows:
+        return summary
+    events: List[Dict[str, Any]] = []
+    for source in ("Payment", "Invoice", "Credit Note"):
+        entry, entry_ts = _latest_statement_entry(rows, source)
+        if not entry:
+            continue
+        amount = _coerce_float(entry.get("credit") or entry.get("debit"))
+        date_label = ""
+        date_val = entry_ts or _parse_log_timestamp(entry.get("date"))
+        if date_val:
+            date_label = date_val.strftime("%Y-%m-%d")
+        else:
+            date_label = str(entry.get("date") or "").strip()
+        events.append(
+            {
+                "type": source,
+                "reference": str(entry.get("reference") or source).strip(),
+                "amount": amount,
+                "date_label": date_label,
+            }
+        )
+    if events:
+        summary["events"] = events
+    return summary
+
+
+def _build_driver_kpi_balance_line(wa_id: Optional[str]) -> Optional[str]:
+    if not wa_id:
+        return None
+    metrics = _fetch_latest_collections_metrics_by_wa([wa_id])
+    if not metrics:
+        return None
+    normalized = _normalize_wa_id(wa_id)
+    entry = metrics.get(normalized) if normalized else None
+    if not entry:
+        digits = re.sub(r"\D", "", str(wa_id))
+        for key, value in metrics.items():
+            if not digits:
+                continue
+            if key.endswith(digits) or digits.endswith(key):
+                entry = value
+                break
+    if not entry:
+        return None
+    balance = entry.get("balance")
+    if balance is None:
+        return None
+    report_label = entry.get("report_date")
+    if not report_label and entry.get("report_dt"):
+        report_dt = entry.get("report_dt")
+        if isinstance(report_dt, datetime):
+            report_label = report_dt.strftime("%Y-%m-%d")
+        else:
+            report_label = str(report_dt)
+    date_phrase = f" as of {report_label}" if report_label else ""
+    return f"Driver KPI summary{date_phrase} shows an outstanding balance of {fmt_rands(balance)}."
+
+
 def warm_driver_roster_cache() -> None:
     try:
         drivers, error, *_ = _load_cached_driver_roster(DRIVER_ROSTER_WARM_LIMIT)
@@ -13002,7 +18738,7 @@ def _format_intraday_update_message(
     diff = int(finished_trips) - int(target_now)
     if diff > 0:
         pace_line = _pick_intraday_variant(ctx, "intraday_ahead", INTRADAY_AHEAD_VARIANTS).format(diff=diff)
-        if now.hour in {10, 12, 14, 18}:
+        if now.hour in {12, 18}:
             praise = _pick_intraday_variant(ctx, "intraday_praise", INTRADAY_PRAISE_PREFIXES)
             if praise:
                 pace_line = f"{praise} {pace_line}"
@@ -13355,8 +19091,11 @@ INTENT_CONFIRMATION_SKIP_INTENTS = {
     "current_time",
     "current_date",
     "smalltalk",
+    "geo_restriction",
     "acknowledgement",
     "account_inquiry",
+    ACCOUNT_BALANCE_INTENT,
+    ACCOUNT_STATEMENT_INTENT,
     "provide_personal_code",
     "progress_update",
     "daily_target_status",
@@ -13383,6 +19122,9 @@ INTENT_CONFIRMATION_SKIP_INTENTS = {
     "media_contacts",
     "media_sticker",
     "media_reaction",
+    BRANDING_CAMPAIGN_INTENT,
+    VEHICLE_CATEGORY_INTENT,
+    SAFETY_INCIDENT_INTENT,
 }
 INTENT_CONFIRMATION_TICKET_INTENTS = {
     "low_demand",
@@ -13527,7 +19269,29 @@ def _resolve_intent_confirmation_reply(msg: str, ctx: Dict[str, Any]) -> Tuple[O
         if choice_match:
             chosen = (pending.get("options") or {}).get(choice_match.group(1))
         else:
-            if _is_account_suspension(lowered):
+            drivable = _extract_car_drivable_status(lowered)
+            workshop_ref = _extract_workshop_reference(lowered)
+            if (drivable is not None and ("car" in lowered or "vehicle" in lowered)) or workshop_ref:
+                chosen = "car_problem"
+            elif _is_car_problem(lowered):
+                chosen = "car_problem"
+            elif _is_no_vehicle(lowered):
+                chosen = "no_vehicle"
+            elif _is_medical_issue(lowered):
+                chosen = "medical_issue"
+            elif _is_vehicle_repossession(lowered):
+                chosen = "vehicle_repossession"
+            elif _is_balance_dispute(lowered):
+                chosen = "balance_dispute"
+            elif _is_account_statement_request(lowered):
+                chosen = ACCOUNT_STATEMENT_INTENT
+            elif _is_account_balance_inquiry(lowered):
+                chosen = ACCOUNT_BALANCE_INTENT
+            elif _is_account_inquiry(lowered):
+                chosen = "account_inquiry"
+            elif _is_accident_message(lowered):
+                chosen = ACCIDENT_REPORT_INTENT
+            elif _is_account_suspension(lowered):
                 chosen = "account_suspension"
             elif _is_app_issue(lowered):
                 chosen = "app_issue"
@@ -13535,6 +19299,15 @@ def _resolve_intent_confirmation_reply(msg: str, ctx: Dict[str, Any]) -> Tuple[O
                 chosen = "hotspot_summary"
             elif _is_low_demand_issue(lowered):
                 chosen = "low_demand"
+            if not chosen:
+                ticket_ctx = ctx.get("_car_ticket")
+                if (
+                    isinstance(ticket_ctx, dict)
+                    and ticket_ctx.get("status") in {"collecting", "pending_ops"}
+                    and not ticket_ctx.get("closed")
+                    and ("car" in lowered or "vehicle" in lowered)
+                ):
+                    chosen = "car_problem"
         if chosen:
             ctx.pop("_intent_confirm_pending", None)
             ctx.pop("_intent_confirm_pending_at", None)
@@ -13603,6 +19376,10 @@ def _resolve_intent_confirmation_reply(msg: str, ctx: Dict[str, Any]) -> Tuple[O
             ctx.pop("_intent_confirm_pending_at", None)
             return intent, None
 
+    if _is_car_policy_request(msg) or ctx.get("_awaiting_policy_number_details"):
+        ctx["_awaiting_policy_number_details"] = True
+        return None, _policy_license_disk_prompt()
+
     return None, pending.get("prompt") or "Please reply yes or no."
 
 
@@ -13627,8 +19404,20 @@ def _should_confirm_intent(intent: str, msg: str, ctx: Dict[str, Any], *, messag
         return False
     if _intent_confirmation_blocked(ctx):
         return False
+    if _is_car_policy_request(msg) or ctx.get("_awaiting_policy_number_details"):
+        return False
     if _intent_confirmed_recent(ctx, intent):
         return False
+    if intent == "car_problem":
+        normalized = _normalize_text(msg or "")
+        lowered = normalized.lower()
+        drivable_status = _extract_car_drivable_status(normalized)
+        if (
+            _is_car_problem(normalized)
+            or (drivable_status is not None and ("car" in lowered or "vehicle" in lowered))
+            or _extract_workshop_reference(normalized)
+        ):
+            return False
     if intent in INTENT_CONFIRMATION_TICKET_INTENTS:
         return True
     if _is_short_ambiguous_message(msg):
@@ -13709,6 +19498,7 @@ def build_reply(
                 "Thanks — I’ll share this POP with Finance to validate and allocate it to your account. "
                 "I’ll update you once it’s allocated."
             )
+            body = _append_ticket_reference(body, ticket_id, "pop_submission")
             return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
         if confirmation is False:
             ctx.pop("_pop_pending_confirmation", None)
@@ -13739,7 +19529,26 @@ def build_reply(
         body = "Thanks — I’m back. What do you want to focus on today: trips, hours, or tips?"
         return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
 
-    if ctx.get("_intent_confirm_pending"):
+    if intent == GEO_RESTRICTION_INTENT:
+        body = (
+            "This car must stay inside Gauteng (you can work in Johannesburg and Pretoria). "
+            "Let me know which hot areas you want to focus on within the province."
+        )
+        return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
+
+    pending_confirm = ctx.get("_intent_confirm_pending")
+    if isinstance(pending_confirm, dict):
+        normalized = _normalize_text(msg or "")
+        lowered = normalized.lower().strip()
+        is_yes_no = _is_positive_confirmation(lowered) or _is_negative_confirmation(lowered)
+        is_choice = pending_confirm.get("type") == "choice" and re.search(r"\b[1-4]\b", lowered)
+        pending_intent = pending_confirm.get("intent")
+        if not is_yes_no and not is_choice and intent not in {"unknown", "clarify"} and intent != pending_intent:
+            ctx.pop("_intent_confirm_pending", None)
+            ctx.pop("_intent_confirm_pending_at", None)
+            pending_confirm = None
+
+    if isinstance(pending_confirm, dict):
         confirmed_intent, prompt = _resolve_intent_confirmation_reply(msg, ctx)
         if prompt:
             return soften_reply(_strip_leading_greeting_or_name(prompt, d.get("display_name") or "", name), name)
@@ -13857,6 +19666,7 @@ def build_reply(
                 "Thanks — I’ll share this POP with Finance to validate and allocate it to your account. "
                 "I’ll update you once it’s allocated."
             )
+            body = _append_ticket_reference(body, ticket_id, "pop_submission")
             return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
         ctx["_pop_pending_confirmation"] = True
         ctx["_pop_pending_media"] = media
@@ -14235,11 +20045,26 @@ def build_reply(
     # store personal code if provided explicitly
     if intent == "provide_personal_code":
         pc = extract_personal_code(msg)
-        if pc:
-            ctx["personal_code"] = pc
-            body = "Thanks — I’ll use this personal code for your account lookups."
-        else:
-            body = "I couldn’t read a personal code. Please send the digits only."
+        if not pc:
+            body = "I couldn’t read a personal code. Please send the digits only (your SA ID or TRN)."
+            return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
+
+        profile = lookup_driver_by_personal_code(pc)
+        if not profile.get("driver_source"):
+            body = (
+                "Thanks — I got the digits but couldn’t match them to an account yet. "
+                "Please double-check the personal code (SA ID or TRN) or ask Ops to confirm your details."
+            )
+            return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
+
+        ctx["personal_code"] = pc
+        ctx["_personal_code_profile"] = profile
+        ctx["_personal_code_confirmed"] = True
+        ctx["_awaiting_personal_code"] = False
+        if ctx.get("_account_statement_requested"):
+            body = _compose_account_statement_body(ctx, d, template_amount)
+            return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
+        body = "Thanks — I’ll use this personal code for your account lookups."
         return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
 
     if intent == "bot_identity":
@@ -14337,18 +20162,29 @@ def build_reply(
             trips = ctx.get("_last_projection_trips")
 
         metrics, reason = get_driver_kpis(wa_id, d)
+        if not metrics and reason and _is_driver_account_issue_reason(reason):
+            logged_reason = ctx.get("_driver_account_issue_logged")
+            if logged_reason != reason:
+                _log_driver_account_lookup_issue(wa_id, d, reason)
+                ctx["_driver_account_issue_logged"] = reason
         avg_from_metrics = None
         if metrics:
             total_trips = metrics.get("trip_count")
             total_gross = metrics.get("gross_earnings")
-            if total_trips and total_trips > 0 and total_gross is not None:
-                try:
-                    avg_from_metrics = float(total_gross) / float(total_trips)
-                except Exception:
-                    avg_from_metrics = None
+        if total_trips and total_trips > 0 and total_gross is not None:
+            try:
+                avg_from_metrics = float(total_gross) / float(total_trips)
+            except Exception:
+                avg_from_metrics = None
         else:
             if reason:
                 ctx["_last_kpi_reason"] = reason
+
+        if not metrics and reason:
+            logged_reason = ctx.get("_driver_account_issue_logged")
+            if logged_reason != reason:
+                _log_driver_account_lookup_issue(wa_id, d, reason)
+                ctx["_driver_account_issue_logged"] = reason
 
         avg_msg = _extract_earnings_per_trip(msg, allow_plain=awaiting_avg)
         if avg_msg:
@@ -14436,6 +20272,11 @@ def build_reply(
         if _is_low_demand_issue(msg_text):
             area_candidates = _extract_low_demand_area_candidates(msg_text)
         if area_candidates:
+            area_candidates = [
+                area
+                for area in area_candidates
+                if area and not _is_accident_message(area)
+            ]
             area_candidates = list(dict.fromkeys(area_candidates))
         if not area_hint and area_candidates:
             area_hint = ", ".join(area_candidates)
@@ -14468,7 +20309,14 @@ def build_reply(
         logged_areas = ctx.get("_low_demand_areas")
         if not isinstance(logged_areas, list):
             logged_areas = []
-        logged_areas = [area for area in logged_areas if area and not _is_low_demand_issue(area)]
+        logged_areas = [
+            area
+            for area in logged_areas
+            if area
+            and area.lower() not in AREA_GENERIC_WORDS
+            and not _is_low_demand_issue(area)
+            and not _is_accident_message(area)
+        ]
 
         pending_kind = ctx.get("_low_demand_pending_kind")
         wants_ticket = False
@@ -14532,6 +20380,7 @@ def build_reply(
                     update_driver_issue_metadata(ticket_id, {"operating_areas": logged_areas})
                 area_label = " and ".join(logged_areas[-2:]) if logged_areas else area_hint
                 body = f"Thanks — I've logged {area_label}. {oph_sentence} Want me to check back later or add another area?"
+                body = _append_ticket_reference(body, ticket_id, "low_demand")
                 return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
 
             if ctx.get("_low_demand_pending"):
@@ -14562,6 +20411,7 @@ def build_reply(
                     if logged_areas and ticket_id:
                         update_driver_issue_metadata(ticket_id, {"operating_areas": logged_areas})
                     body = f"Thanks — I've logged that. {oph_sentence} Want me to check back later or add another area?"
+                    body = _append_ticket_reference(body, ticket_id, "low_demand")
                     return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
                 body = "Thanks. Which suburb or mall/landmark are you operating in right now (or planning to work)?"
                 return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
@@ -14574,6 +20424,7 @@ def build_reply(
                 "Which suburb or mall/landmark are you operating in right now (or planning to work)? You can share more than one. "
                 f"{oph_sentence}"
             )
+            body = _append_ticket_reference(body, ticket_id, "low_demand")
             return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
 
         ctx["_low_demand_tips_only"] = True
@@ -14649,6 +20500,7 @@ def build_reply(
                     "Thanks — I’ve logged that and asked Ops to check the suspension reason. "
                     "I’ll update you as soon as I hear back."
                 )
+                body = _append_ticket_reference(body, ticket_id, "account_suspension")
                 return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
             body = "Thanks — can you share the exact message you saw in the app (or a screenshot) so we can find the cause quickly?"
             return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
@@ -14658,6 +20510,7 @@ def build_reply(
             "Sorry to hear your Bolt account is suspended. I’ve opened a ticket to check the cause. "
             "What message did you see in the app (or do you have a screenshot), and when did it start?"
         )
+        body = _append_ticket_reference(body, ticket_id, "account_suspension")
         return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
 
     if intent == "app_issue":
@@ -14710,6 +20563,7 @@ def build_reply(
                     update_driver_issue_status(ticket_id, "pending_ops")
                 ctx["_app_issue_pending"] = False
                 body = "Thanks — I’ve logged that for support and asked Ops to check. I’ll update you as soon as I hear back."
+                body = _append_ticket_reference(body, ticket_id, "app_issue")
                 return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
             body = "Thanks — can you share the exact error message or a screenshot so we can diagnose quickly?"
             return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
@@ -14719,11 +20573,16 @@ def build_reply(
             "Sorry you're having app trouble. Are you seeing an error or login issue, or does it say your account is blocked/suspended? "
             "Please share the exact message (or a screenshot) and I’ll log it for support."
         )
+        body = _append_ticket_reference(body, ticket_id, "app_issue")
         return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
 
     if intent == "medical_issue":
         ctx["_active_concern"] = {"type": "medical", "opened_at": time.time(), "message": msg}
         ctx.pop("_pending_intent", None)
+        ctx.pop("_low_demand_pending", None)
+        ctx.pop("_low_demand_pending_at", None)
+        ctx.pop("_low_demand_pending_kind", None)
+        ctx.pop("_low_demand_tips_only", None)
         ctx["_awaiting_target_update"] = False
         ctx.pop("_pending_goal", None)
         ctx.pop("_awaiting_goal_confirm", None)
@@ -14931,6 +20790,7 @@ def build_reply(
             "Sorry you're not feeling well. When you can, please return the vehicle to the office so ops can assist. "
             "Are you planning to continue operating with My Next Car once you're better, or are you planning on handing the car back?"
         )
+        body = _append_ticket_reference(body, ticket_id, "medical_pause")
         return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
 
     if intent == "no_vehicle":
@@ -14958,6 +20818,7 @@ def build_reply(
                 )
             ctx["_no_vehicle_pending"] = None
             body = "Thanks - I'll pass that to Finance and follow up if they need anything else."
+            body = _append_ticket_reference(body, ticket_id, "finance_followup")
             return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
         if pending_followup == "workshop_details":
             ticket_ctx = ctx.get("_no_vehicle_ticket") if isinstance(ctx.get("_no_vehicle_ticket"), dict) else None
@@ -14979,6 +20840,7 @@ def build_reply(
                     )
             ctx["_no_vehicle_pending"] = None
             body = "Thanks - I've added those details for ops and will follow up with you."
+            body = _append_ticket_reference(body, ticket_id, "workshop_followup")
             return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
         reason = alt_reason or _parse_no_vehicle_reason(msg)
         if reason:
@@ -15014,6 +20876,7 @@ def build_reply(
                 "Finance to reduce it. I've asked Finance to contact you within 24 hours to set up a payment plan. "
                 "What's the best time or number to reach you?"
             )
+            body = _append_ticket_reference(body, ticket_id, "finance_followup")
             ctx["_no_vehicle_pending"] = "finance_details"
             return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
         if reason == "workshop":
@@ -15031,6 +20894,7 @@ def build_reply(
                 "Thanks for letting me know. I've logged a workshop follow-up for ops. "
                 "If you have the ticket number, car location, or expected completion date, send it and I'll add it."
             )
+            body = _append_ticket_reference(body, ticket_id, "workshop_followup")
             ctx["_no_vehicle_pending"] = "workshop_details"
             return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
         if reason == "assignment":
@@ -15058,6 +20922,7 @@ def build_reply(
                 "Thanks for clarifying. What exactly happened and where is the car now? "
                 "Share a short note and I'll update ops."
             )
+            body = _append_ticket_reference(body, ticket_id, "no_vehicle_other")
             return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
 
         body = "Thanks for the update. What happened, and do you need a replacement vehicle or just time off?"
@@ -15194,8 +21059,176 @@ def build_reply(
         body = " ".join(parts)
         return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
 
+    if intent == SAFETY_INCIDENT_INTENT:
+        ctx.pop("_pending_intent", None)
+        ticket_id = _ensure_issue_ticket(
+            ctx,
+            wa_id,
+            msg or "Safety incident reported",
+            d,
+            issue_type="safety_incident",
+            ctx_key="_safety_incident_ticket",
+            existing_types=["safety_incident"],
+        )
+        ticket_ctx = ctx.get("_safety_incident_ticket") if isinstance(ctx.get("_safety_incident_ticket"), dict) else None
+        ctx["_active_concern"] = {
+            "type": "safety_incident",
+            "opened_at": time.time(),
+            "message": msg,
+        }
+        if ticket_id:
+            update_driver_issue_metadata(
+                ticket_id,
+                {
+                    "safety_incident": True,
+                    "reported_at": jhb_now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "message": msg,
+                },
+            )
+            if not ticket_ctx or ticket_ctx.get("status") != "pending_ops":
+                update_driver_issue_status(ticket_id, "pending_ops")
+            if ticket_ctx:
+                ticket_ctx["status"] = "pending_ops"
+                ctx["_safety_incident_ticket"] = ticket_ctx
+        body = (
+            "I'm really sorry to hear that. Are you safe? I've alerted ops and an agent will contact you soon. "
+            "Please share where it happened and the time, and let me know if you'd like a call."
+        )
+        body = _append_ticket_reference(body, ticket_id, "safety_incident")
+        return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
+
+    if intent == BRANDING_CAMPAIGN_INTENT:
+        ctx.pop("_pending_intent", None)
+        ticket_id = _ensure_issue_ticket(
+            ctx,
+            wa_id,
+            msg or "Branding campaign issue",
+            d,
+            issue_type="branding_campaign",
+            ctx_key="_branding_campaign_ticket",
+            existing_types=["branding_campaign"],
+        )
+        ctx["_active_concern"] = {
+            "type": "branding_campaign",
+            "opened_at": time.time(),
+            "message": msg,
+        }
+        if ticket_id:
+            update_driver_issue_metadata(
+                ticket_id,
+                {
+                    "branding_campaign_issue": True,
+                    "reported_at": jhb_now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "message": msg,
+                },
+            )
+        category_ticket_id = None
+        if _is_vehicle_category_issue(msg or ""):
+            category_ticket_id = _ensure_issue_ticket(
+                ctx,
+                wa_id,
+                msg or "Vehicle category issue",
+                d,
+                issue_type="vehicle_category",
+                ctx_key="_vehicle_category_ticket",
+                existing_types=["vehicle_category"],
+            )
+            if category_ticket_id:
+                update_driver_issue_metadata(
+                    category_ticket_id,
+                    {
+                        "vehicle_category_issue": True,
+                        "reported_at": jhb_now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "message": msg,
+                    },
+                )
+        if category_ticket_id:
+            body = (
+                "Thanks for flagging that. I’ve opened tickets for ops to review your branding campaign/earnings "
+                "and Bolt vehicle category. Please share any screenshots or the exact error message you see."
+            )
+        else:
+            body = (
+                "Thanks for flagging that. I’ve opened a ticket for ops to review your branding campaign/earnings. "
+                "Please share the campaign name and any screenshots or error message you see."
+            )
+        body = _append_ticket_reference_list(
+            body,
+            [(ticket_id, "branding_campaign"), (category_ticket_id, "vehicle_category")],
+        )
+        return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
+
+    if intent == VEHICLE_CATEGORY_INTENT:
+        ctx.pop("_pending_intent", None)
+        ticket_id = _ensure_issue_ticket(
+            ctx,
+            wa_id,
+            msg or "Vehicle category issue",
+            d,
+            issue_type="vehicle_category",
+            ctx_key="_vehicle_category_ticket",
+            existing_types=["vehicle_category"],
+        )
+        ctx["_active_concern"] = {
+            "type": "vehicle_category",
+            "opened_at": time.time(),
+            "message": msg,
+        }
+        if ticket_id:
+            update_driver_issue_metadata(
+                ticket_id,
+                {
+                    "vehicle_category_issue": True,
+                    "reported_at": jhb_now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "message": msg,
+                },
+            )
+        branding_ticket_id = None
+        if _is_branding_campaign_issue(msg or ""):
+            branding_ticket_id = _ensure_issue_ticket(
+                ctx,
+                wa_id,
+                msg or "Branding campaign issue",
+                d,
+                issue_type="branding_campaign",
+                ctx_key="_branding_campaign_ticket",
+                existing_types=["branding_campaign"],
+            )
+            if branding_ticket_id:
+                update_driver_issue_metadata(
+                    branding_ticket_id,
+                    {
+                        "branding_campaign_issue": True,
+                        "reported_at": jhb_now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "message": msg,
+                    },
+                )
+        if branding_ticket_id:
+            body = (
+                "Thanks — I’ve opened tickets for ops to review your Bolt vehicle category and branding campaign status. "
+                "Please share the category you expect and any screenshots or errors."
+            )
+        else:
+            body = (
+                "Thanks — I’ve opened a ticket for ops to review your Bolt vehicle category. "
+                "Please share the category you expect and any screenshots or errors."
+            )
+        body = _append_ticket_reference_list(
+            body,
+            [(ticket_id, "vehicle_category"), (branding_ticket_id, "branding_campaign")],
+        )
+        return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
+
     if intent == BRANDING_BONUS_INTENT:
         ctx.pop("_pending_intent", None)
+        for key in (
+            "_medical_pending_decision",
+            "_medical_pending_commitment",
+            "_medical_pending_location",
+            "_medical_pending_certificate",
+            "_medical_commitment_pending_unit",
+        ):
+            ctx.pop(key, None)
         bonus_ctx = ctx.get("_branding_bonus") if isinstance(ctx.get("_branding_bonus"), dict) else None
         if not bonus_ctx:
             bonus_ctx = {"opened_at": time.time(), "messages": []}
@@ -15287,6 +21320,7 @@ def build_reply(
                 f"I’ve already logged a ticket about the {week_info} branding bonus with your {int(trip_count)} trips. "
                 "Ops will review and get back to you—shout if anything changes in the meantime."
             )
+            body = _append_ticket_reference(body, ticket_id, "branding_bonus")
             return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
 
         summary = (
@@ -15319,6 +21353,7 @@ def build_reply(
                 f"Thanks for confirming—I've logged a ticket for ops to review the {week_info} branding bonus "
                 f"with your {int(trip_count)} trips. They'll investigate and follow up directly."
             )
+            body = _append_ticket_reference(body, ticket_id, "branding_bonus")
             return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
 
         bonus_ctx["awaiting"] = None
@@ -15360,10 +21395,65 @@ def build_reply(
             "If you’ve already paid, please send your Proof of Payment (POP) and I’ll escalate to our Accounts team immediately and get back to you. "
             "If not, kindly make a payment toward your MNC account and share the POP—once received, we’ll request cash reactivation without delay."
         )
+        body = _append_ticket_reference(body, ticket_id, "cash_ride")
+        return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
+
+    if intent == PAYMENT_PLAN_INTENT:
+        amount_val = _parse_payment_amount(msg or "")
+        when_hint = _extract_payment_date_hint(msg or "")
+        amount_text = fmt_rands(amount_val) if amount_val else "that amount"
+        when_text = f" {when_hint}" if when_hint else ""
+        body = (
+            f"Thanks for confirming you’ll pay {amount_text}{when_text}. "
+            "I’ll log the plan and check in once you’ve sent the POP so we can clear the outstanding balance. "
+            "Please send proof of payment when the transfer goes through."
+        )
+        log_interaction(
+            wa_id,
+            channel="ptp",
+            amount=amount_val,
+            ptp_date=when_hint,
+            status="planned",
+        )
+        _record_payment_plan(ctx, amount_val, when_hint)
         return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
 
     if intent == CASH_BALANCE_UPDATE_INTENT:
         ctx.pop("_pending_intent", None)
+        if _should_skip_pop_followup(ctx, msg, message_type):
+            amount_val = _parse_payment_amount(msg or "")
+            when_hint = _extract_payment_date_hint(msg or "")
+            due_date = _resolve_payment_plan_due(when_hint)
+            _record_payment_plan(ctx, amount_val, when_hint)
+            plan_ticket_id = _ensure_payment_plan_ticket(
+                ctx,
+                wa_id,
+                d,
+                amount=amount_val,
+                due_date=due_date,
+                message=msg,
+            )
+            log_interaction(
+                wa_id,
+                channel="ptp",
+                amount=amount_val,
+                ptp_date=due_date.isoformat() if due_date else (when_hint or None),
+                status="planned",
+            )
+            outstanding_val = _coerce_float(d.get("xero_balance"))
+            outstanding_text = (
+                f"Outstanding balance: {fmt_rands(outstanding_val)}. " if outstanding_val else ""
+            )
+            due_desc = _format_payment_plan_due_description(due_date)
+            amount_text = fmt_rands(amount_val) if amount_val else "that amount"
+            body = (
+                f"Thanks for confirming you’ll pay {amount_text}. "
+                f"{outstanding_text}I’ve recorded this as a payment plan due {due_desc} and will follow up once the POP arrives. "
+                "Send the POP when you make the transfer so I can clear the balance."
+            )
+            if plan_ticket_id:
+                body = _append_ticket_reference(body, plan_ticket_id, "payment_plan")
+            return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
         ticket_ctx = ctx.get("_cash_ticket") if isinstance(ctx.get("_cash_ticket"), dict) else None
         ticket_id = ticket_ctx.get("ticket_id") if ticket_ctx else None
 
@@ -15407,6 +21497,7 @@ def build_reply(
             body = (
                 "Thanks for sending the POP—I’ve logged it with Accounts right away and will follow up to get cash rides reactivated."
             )
+            body = _append_ticket_reference(body, ticket_id, "cash_ride")
             return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
 
         ticket_ctx["awaiting_pop"] = True
@@ -15414,42 +21505,106 @@ def build_reply(
         body = (
             "Thank you for settling the balance. Please share a clear photo of the Proof of Payment (POP) so I can log it and request cash reactivation."
         )
+        body = _append_ticket_reference(body, ticket_id, "cash_ride")
         return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
 
     if intent == ACCIDENT_REPORT_INTENT:
         ctx.pop("_pending_intent", None)
+        ctx.pop("_low_demand_pending", None)
+        ctx.pop("_low_demand_pending_at", None)
+        ctx.pop("_low_demand_pending_kind", None)
+        ctx.pop("_low_demand_tips_only", None)
         raw_case = ctx.get("_accident_case")
         case = dict(raw_case) if isinstance(raw_case, dict) else {}
         ticket_id = case.get("ticket_id")
         status = case.get("status")
+        new_ticket = False
+        if _is_accident_cancellation(msg):
+            closed_at = jhb_now().strftime("%Y-%m-%d %H:%M:%S")
+            if ticket_id:
+                update_driver_issue_metadata(
+                    ticket_id,
+                    {
+                        "auto_closed": True,
+                        "auto_closed_at": closed_at,
+                        "auto_closed_reason": "driver_reported_no_accident",
+                    },
+                )
+                update_driver_issue_status(ticket_id, "closed")
+                log_driver_issue_ticket_event(
+                    ticket_id,
+                    admin_email=None,
+                    action_type="auto_closed",
+                    from_status=status,
+                    to_status="closed",
+                    note="Driver reported no accident / false alarm.",
+                )
+            if case:
+                ctx["_last_accident_case"] = {
+                    "ticket_id": ticket_id,
+                    "closed_at": closed_at,
+                    "status": "closed",
+                    "metadata": {"auto_closed_reason": "driver_reported_no_accident"},
+                }
+            ctx.pop("_accident_case", None)
+            if (ctx.get("_active_concern") or {}).get("type") == "accident":
+                ctx.pop("_active_concern", None)
+            body = (
+                "Thanks for confirming—I'll close the accident report. "
+                "If you need help with anything else, just let me know."
+            )
+            return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
         if not ticket_id or status not in {"collecting", "pending_ops"}:
             ticket_id = create_driver_issue_ticket(wa_id, msg, d, issue_type="accident")
+            new_ticket = True
             case = {
                 "ticket_id": ticket_id,
                 "status": "collecting",
                 "driver_ok": None,
                 "medical_needed": None,
+                "police_on_site": None,
                 "location_received": False,
                 "location_text": None,
                 "photos_received": False,
+                "damage_photo_received": False,
+                "plate_photo_received": False,
+                "license_disk_photo_received": False,
+                "license_disk_details_received": False,
+                "driver_license_photo_received": False,
+                "other_driver_license_photo_received": False,
                 "other_vehicle_involved": None,
+                "vehicle_company": None,
                 "vehicle_details": None,
                 "other_driver_details": None,
                 "created_at": time.time(),
                 "awaiting": "safety",
+                "_ticket_ack_sent": False,
+                "_towing_info_sent": False,
+                "_photos_prompted": False,
             }
         else:
             case.setdefault("status", status or "collecting")
             case.setdefault("driver_ok", None)
             case.setdefault("medical_needed", None)
+            case.setdefault("police_on_site", None)
             case.setdefault("location_received", False)
             case.setdefault("location_text", None)
             case.setdefault("photos_received", False)
+            case.setdefault("damage_photo_received", False)
+            case.setdefault("plate_photo_received", False)
+            case.setdefault("license_disk_photo_received", False)
+            case.setdefault("license_disk_details_received", False)
+            case.setdefault("driver_license_photo_received", False)
+            case.setdefault("other_driver_license_photo_received", False)
             case.setdefault("other_vehicle_involved", None)
+            case.setdefault("vehicle_company", None)
             case.setdefault("vehicle_details", None)
             case.setdefault("other_driver_details", None)
             case.setdefault("created_at", time.time())
             case.setdefault("awaiting", "safety")
+            case.setdefault("_ticket_ack_sent", False)
+            case.setdefault("_towing_info_sent", False)
+            case.setdefault("_photos_prompted", False)
         case["last_message_at"] = time.time()
 
         ctx["_active_concern"] = {"type": "accident", "opened_at": case.get("created_at", time.time()), "message": msg}
@@ -15457,8 +21612,10 @@ def build_reply(
         received_media = False
         vehicle_details_captured = False
         driver_details_captured = False
+        license_disk_details_captured = False
         address_captured = False
         metadata_patch: Dict[str, Any] = {}
+        last_photo_label: Optional[str] = None
 
         if location and (location.get("latitude") is not None or location.get("longitude") is not None):
             if not case.get("location_received"):
@@ -15486,13 +21643,30 @@ def build_reply(
             metadata_patch["location_text"] = case["location_text"]
 
         if media and media.get("url") and message_type in ACCIDENT_MEDIA_TYPES:
-            if not case.get("photos_received"):
-                received_media = True
+            received_media = True
             case["photos_received"] = True
             case["_last_media_url"] = media.get("url")
             if ticket_id:
                 append_driver_issue_media(ticket_id, media)
             metadata_patch["photos_received"] = True
+            photo_type = _accident_photo_type_from_text(
+                msg,
+                other_driver_involved=bool(case.get("other_vehicle_involved")),
+            )
+            if photo_type == "other_driver_license" and not case.get("other_vehicle_involved"):
+                case["other_vehicle_involved"] = True
+                metadata_patch["other_vehicle_involved"] = True
+            missing_photo_types = _accident_missing_photo_types(case)
+            if photo_type and photo_type not in missing_photo_types:
+                photo_type = None
+            if not photo_type and missing_photo_types:
+                photo_type = missing_photo_types[0]
+            if photo_type:
+                state_key = ACCIDENT_PHOTO_STATE_KEYS.get(photo_type)
+                if state_key:
+                    case[state_key] = True
+                    metadata_patch[state_key] = True
+                last_photo_label = ACCIDENT_PHOTO_ACK_LABELS.get(photo_type)
 
         prev_driver_ok = case.get("driver_ok")
         prev_medical_needed = case.get("medical_needed")
@@ -15507,6 +21681,53 @@ def build_reply(
             case["medical_needed"] = medical_needed_resp
             metadata_patch["medical_needed"] = medical_needed_resp
             medical_status_updated = True
+
+        prev_police_on_site = case.get("police_on_site")
+        police_resp = _interpret_police_response(msg)
+        police_status_updated = False
+        if police_resp is not None and police_resp != prev_police_on_site:
+            case["police_on_site"] = police_resp
+            metadata_patch["police_on_site"] = police_resp
+            police_status_updated = True
+
+        vehicle_model = case.get("vehicle_model") or d.get("asset_model")
+        vehicle_company = case.get("vehicle_company") or d.get("company")
+        if vehicle_model and not case.get("vehicle_model"):
+            case["vehicle_model"] = vehicle_model
+            metadata_patch["vehicle_model"] = vehicle_model
+        if vehicle_company and not case.get("vehicle_company"):
+            case["vehicle_company"] = vehicle_company
+            metadata_patch["vehicle_company"] = vehicle_company
+
+        disk_model, disk_company = _extract_license_disk_details(msg)
+        if disk_model:
+            license_disk_details_captured = True
+            if not case.get("vehicle_model"):
+                case["vehicle_model"] = disk_model
+                metadata_patch["vehicle_model"] = disk_model
+        if disk_company:
+            license_disk_details_captured = True
+            if not case.get("vehicle_company"):
+                case["vehicle_company"] = disk_company
+                metadata_patch["vehicle_company"] = disk_company
+        if license_disk_details_captured:
+            metadata_patch["license_disk_details_text"] = msg.strip()
+            if case.get("vehicle_model") and case.get("vehicle_company"):
+                case["license_disk_details_received"] = True
+                metadata_patch["license_disk_details_received"] = True
+
+        vehicle_model = case.get("vehicle_model") or vehicle_model
+        vehicle_company = case.get("vehicle_company") or vehicle_company
+        _remember_towing_vehicle_info(ctx, vehicle_model, vehicle_company)
+        vehicle_reg = d.get("car_reg_number") or case.get("vehicle_reg")
+        if vehicle_reg and not case.get("vehicle_reg"):
+            case["vehicle_reg"] = vehicle_reg
+            metadata_patch["vehicle_reg"] = vehicle_reg
+        if not case.get("policy_number") and vehicle_model and vehicle_company:
+            policy_number = _policy_number_for_model(vehicle_model, company=vehicle_company)
+            if policy_number:
+                case["policy_number"] = policy_number
+                metadata_patch["policy_number"] = policy_number
 
         prev_other_vehicle = case.get("other_vehicle_involved")
         other_vehicle_resp = _interpret_other_vehicle_response(msg)
@@ -15570,27 +21791,83 @@ def build_reply(
         else:
             ctx["_accident_case"] = case
 
-        ack_sentence: Optional[str] = None
+        prefix_parts: List[str] = []
+        if new_ticket and not case.get("_ticket_ack_sent"):
+            prefix_parts.append(
+                "I'm really sorry this happened. I've opened a ticket for this accident and alerted ops."
+            )
+            case["_ticket_ack_sent"] = True
+
+        update_ack: Optional[str] = None
         if medical_status_updated and case.get("medical_needed"):
-            ack_sentence = "I’m alerting ops now—please stay where it’s safe."
+            update_ack = "I'm alerting ops now - please stay where it's safe."
+        elif police_status_updated:
+            update_ack = "Thanks - I've noted the police status."
         elif received_location:
-            ack_sentence = "Thanks for the location pin—I’ve logged it for ops."
+            update_ack = "Thanks for the location pin - I've logged it for ops."
         elif address_captured:
-            ack_sentence = "Thanks for sharing the location—I’ve logged it for ops."
+            update_ack = "Thanks for sharing the location - I've logged it for ops."
         elif received_media:
-            ack_sentence = "Thanks for the photo—I’ve added it to the report."
+            if last_photo_label:
+                update_ack = f"Thanks for the {last_photo_label} photo - I've added it to the report."
+            else:
+                update_ack = "Thanks for the photo - I've added it to the report."
+        elif license_disk_details_captured:
+            update_ack = "Thanks - I've noted the license disk details."
         elif vehicle_details_captured:
-            ack_sentence = "I’ve logged the other vehicle details."
+            update_ack = "I've logged the other vehicle details."
         elif driver_details_captured:
-            ack_sentence = "I’ve saved the other driver’s details."
+            update_ack = "I've saved the other driver's details."
+        if update_ack:
+            prefix_parts.append(update_ack)
+        if ticket_id and not case.get("_ticket_ref_sent"):
+            prefix_parts.append(_format_ticket_reference(ticket_id, "accident"))
+            case["_ticket_ref_sent"] = True
 
         prompt: str
         if stage == "safety":
+            towing_line = ""
+            if not case.get("_towing_info_sent"):
+                reg_text = "vehicle registration"
+                if case.get("vehicle_reg"):
+                    reg_text = f"vehicle reg {case.get('vehicle_reg')}"
+                policy_text = "policy number"
+                if case.get("policy_number"):
+                    policy_text = f"policy number {case.get('policy_number')}"
+                    if case.get("vehicle_model") and case.get("vehicle_company"):
+                        policy_text = (
+                            f"policy number {case.get('policy_number')} for your "
+                            f"{case.get('vehicle_company')} {case.get('vehicle_model')}"
+                        )
+                    elif case.get("vehicle_model"):
+                        policy_text = f"policy number {case.get('policy_number')} for your {case.get('vehicle_model')}"
+                towing_line = (
+                    f"If you need towing, call {ACCIDENT_TOWING_NUMBER} and give them your {reg_text} and {policy_text}."
+                )
+                if not case.get("policy_number"):
+                    if case.get("vehicle_model") and case.get("vehicle_company"):
+                        towing_line += (
+                            f" I can confirm the policy number for your "
+                            f"{case.get('vehicle_company')} {case.get('vehicle_model')} if needed."
+                        )
+                    elif case.get("vehicle_model"):
+                        towing_line += " Reply with the company on the license disk if you need the policy number."
+                    elif case.get("vehicle_company"):
+                        towing_line += " Reply with the vehicle model on the license disk if you need the policy number."
+                    else:
+                        towing_line += " Reply with the vehicle model and company shown on the license disk if you need the policy number."
+                case["_towing_info_sent"] = True
             if case.get("_safety_prompted"):
-                prompt = "Just checking—do you or anyone else need medical attention so I can get help to you?"
+                prompt = "Just checking - do you or anyone else need medical assistance, and is the police on site?"
             else:
-                prompt = "That sounds scary—are you okay right now, and if anyone needs medical help please call 112 and tell me so I can alert ops. 🚑"
+                prompt = (
+                    "Are you safe right now, and does anyone need medical assistance? "
+                    "If anyone needs help, please call 112 and tell me so I can alert ops. "
+                    "Is the police on site?"
+                )
                 case["_safety_prompted"] = True
+            if towing_line:
+                prompt = f"{prompt} {towing_line}"
         elif stage == "location":
             if case.get("medical_needed"):
                 prompt = "Ops is on alert—could you drop a live location pin or share the address so help can reach you quickly?"
@@ -15602,24 +21879,85 @@ def build_reply(
             prompt = "Please send the other vehicle’s registration plate and a quick description."
         elif stage == "other_driver_details":
             prompt = "Please share the other driver’s name and phone number if you have them."
+        elif stage == "photos":
+            missing = _accident_missing_photo_types(case)
+            if missing:
+                labels = [ACCIDENT_PHOTO_LABELS.get(t, t) for t in missing]
+                photo_list = _format_simple_list(labels)
+                prompt = f"When you can, please send clear photos of {photo_list}."
+                if not case.get("_photos_prompted"):
+                    prompt += " You can send them one by one; a short caption like 'damage', 'plate', or 'license disk' helps."
+                    case["_photos_prompted"] = True
+                if "license_disk" in missing:
+                    prompt += " If you can't send the license disk photo, please reply with the model and company shown on it."
+            else:
+                prompt = "Thanks for the photos - I've logged them for ops."
         else:
-            ack_sentence = ack_sentence or "Thanks for all the details—I’ve logged them for ops."
+            if not prefix_parts:
+                prefix_parts.append("Thanks for all the details - I've logged them for ops.")
             extra = " They’ll contact you shortly; if anything changes before they arrive, tell me right away. 🙏"
             prompt = extra.strip()
             ctx.pop("_active_concern", None)
 
         parts: List[str] = []
-        if ack_sentence:
-            parts.append(ack_sentence)
+        if prefix_parts:
+            parts.extend(prefix_parts)
         parts.append(prompt)
         body = " ".join(parts)
         return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
 
     if intent == "car_problem":
         ctx.pop("_pending_intent", None)
+        ctx.pop("_low_demand_pending", None)
+        ctx.pop("_low_demand_pending_at", None)
+        ctx.pop("_low_demand_pending_kind", None)
+        ctx.pop("_low_demand_tips_only", None)
         ticket_ctx = ctx.get("_car_ticket") if isinstance(ctx.get("_car_ticket"), dict) else None
         ticket_status = ticket_ctx.get("status") if ticket_ctx else None
         ticket_id = ticket_ctx.get("ticket_id") if ticket_ctx else None
+        drivable_status = _extract_car_drivable_status(msg)
+        workshop_ref = _extract_workshop_reference(msg)
+        policy_request = _is_car_policy_request(msg)
+        tow_reason = ctx.get("_towing_request_reason") or _towing_reason(msg)
+        if _is_towing_request(msg) or tow_reason:
+            reply = _build_towing_reply(tow_reason, ctx, d, message=msg)
+            return soften_reply(_strip_leading_greeting_or_name(reply, d.get("display_name") or "", name), name)
+        vehicle_model = (d.get("asset_model") or d.get("model") or "").strip()
+        vehicle_company = (d.get("company") or "").strip() or None
+        if ticket_ctx:
+            stored_model = ticket_ctx.get("vehicle_model")
+            if not vehicle_model and stored_model:
+                vehicle_model = str(stored_model).strip()
+            stored_company = ticket_ctx.get("vehicle_company")
+            if not vehicle_company and stored_company:
+                stored_company = str(stored_company).strip()
+                if stored_company:
+                    vehicle_company = stored_company
+        disk_model, disk_company = _extract_license_disk_details(msg)
+        if disk_model:
+            vehicle_model = disk_model
+        if disk_company:
+            vehicle_company = disk_company
+        model_workshop = _lookup_workshop_for_model(vehicle_model)
+        model_workshop_label = _format_workshop_label(model_workshop)
+        workshop_question = _is_workshop_destination_question(msg or "")
+        workshop_source = "driver" if workshop_ref and workshop_ref != "workshop" else None
+        if workshop_ref == "workshop":
+            workshop_ref = None
+        if ticket_ctx:
+            stored_drivable = ticket_ctx.get("car_drivable")
+            if drivable_status is None and stored_drivable is not None:
+                drivable_status = bool(stored_drivable)
+            stored_workshop = ticket_ctx.get("_workshop_reference")
+            if not workshop_ref and stored_workshop:
+                workshop_ref = stored_workshop
+                workshop_source = workshop_source or "ticket"
+        if drivable_status is True and not workshop_ref and model_workshop_label:
+            workshop_ref = model_workshop_label
+            workshop_source = "model"
+        workshop_hint = workshop_ref or model_workshop_label
+        vehicle_model_display = vehicle_model or None
+        _remember_towing_vehicle_info(ctx, vehicle_model, vehicle_company)
 
         if not ticket_ctx or ticket_status not in {"collecting", "pending_ops"} or not ticket_id:
             ticket_id = create_driver_issue_ticket(wa_id, msg, d)
@@ -15632,10 +21970,164 @@ def build_reply(
             }
             ctx["_car_ticket"] = ticket_ctx
             ctx["_active_concern"] = {"type": "car", "opened_at": time.time(), "message": msg}
+            if drivable_status is not None:
+                ticket_ctx["car_drivable"] = bool(drivable_status)
+            if workshop_ref:
+                ticket_ctx["_workshop_reference"] = workshop_ref
+            if vehicle_model:
+                ticket_ctx["vehicle_model"] = vehicle_model
+            if vehicle_company:
+                ticket_ctx["vehicle_company"] = vehicle_company
+            towing_line = None
+            towing_policy_number = None
+            prev_policy_number = ticket_ctx.get("policy_number")
+        tow_arranged = _is_tow_arranged_confirmation(msg)
+        if tow_arranged and ticket_id:
+            prev_status = ticket_ctx.get("status")
+            if not _is_ticket_status_closed(prev_status):
+                update_driver_issue_status(ticket_id, "closed")
+            log_driver_issue_ticket_event(
+                    ticket_id,
+                    admin_email=None,
+                    action_type="tow_confirmed",
+                    from_status=prev_status,
+                    to_status="closed",
+                    note="Driver confirmed tow arranged",
+                )
+            ticket_ctx["status"] = "closed"
+            ticket_ctx["closed"] = True
+            timestamp = jhb_now().strftime("%Y-%m-%d %H:%M:%S")
+            ticket_ctx["closed_at"] = timestamp
+            ticket_ctx["awaiting_media"] = False
+            ticket_ctx["awaiting_location"] = False
+            ctx["_car_ticket"] = ticket_ctx
+            ctx.pop("_active_concern", None)
+            ctx["_towing_followup_sent_at"] = time.time()
+            metadata_patch = {
+                "tow_arranged_confirmed_at": timestamp,
+                "tow_arranged_note": msg.strip(),
+            }
+            update_driver_issue_metadata(ticket_id, metadata_patch)
             body = (
-                "I’ve logged this for the workshop. Please park safely and send one clear photo of the issue with a short note about any warning lights, "
-                "then drop a pin or address so the ops team knows where to find the car."
+                "Thanks for letting me know the tow was arranged. "
+                "I’ll close this ticket now—reach out if you need anything else."
             )
+            return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
+        if policy_request:
+            ticket_ctx["_license_disk_info_sent"] = True
+            ctx["_awaiting_policy_number_details"] = True
+            models_hint = "Vitz, S-Presso, Dzire, Bajaj, Almera, Micra"
+            body = (
+                f"To spot the company name on the license disk, open {LICENSE_DISK_EXAMPLE_URL} and look for the 'Company' label. "
+                f"Once you send the vehicle model ({models_hint}) and company shown on that disk, I’ll provide the policy number."
+            )
+            return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
+
+        if drivable_status is False or policy_request:
+            towing_line, towing_policy_number = _build_car_towing_line(
+                vehicle_model=vehicle_model_display,
+                vehicle_company=vehicle_company,
+            )
+            if towing_policy_number and towing_policy_number != prev_policy_number:
+                ticket_ctx["policy_number"] = towing_policy_number
+            policy_prompt_needed = policy_request and not towing_policy_number
+            if ticket_ctx.get("_towing_info_sent") and not (
+                towing_policy_number and towing_policy_number != prev_policy_number
+            ) and not policy_prompt_needed:
+                towing_line = None
+            if not towing_policy_number and (towing_line or policy_request):
+                if _license_disk_guide_available() and not ticket_ctx.get("_license_disk_guide_sent"):
+                    ticket_ctx["_license_disk_guide_pending"] = True
+            drivable_line = None
+            if drivable_status is None:
+                if workshop_source in {"driver", "ticket"} and not workshop_question:
+                    drivable_line = "Can you still drive the car safely?"
+                else:
+                    drivable_line = _build_car_drivable_line(
+                        None,
+                        workshop_label=workshop_hint,
+                        vehicle_model=vehicle_model_display,
+                        question=True,
+                    )
+                ticket_ctx["_drivable_prompted"] = True
+            elif drivable_status is True:
+                if workshop_source not in {"driver", "ticket"}:
+                    drivable_line = _build_car_drivable_line(
+                        True,
+                        workshop_label=workshop_ref or workshop_hint,
+                        vehicle_model=vehicle_model_display,
+                    )
+                    ticket_ctx["_workshop_advised"] = True
+            elif drivable_status is False:
+                drivable_line = _build_car_drivable_line(
+                    False,
+                    workshop_label=None,
+                    vehicle_model=vehicle_model_display,
+                )
+                ticket_ctx["_drivable_warned"] = True
+            if ticket_id:
+                metadata_patch = _build_car_ticket_metadata_patch(
+                    msg=msg,
+                    drivable_status=drivable_status,
+                    workshop_ref=workshop_ref,
+                    workshop_source=workshop_source,
+                    vehicle_model=vehicle_model_display,
+                    vehicle_company=vehicle_company,
+                    policy_number=towing_policy_number,
+                    workshop_info=model_workshop,
+                )
+                if metadata_patch:
+                    update_driver_issue_metadata(ticket_id, metadata_patch)
+            workshop_from_driver = workshop_source in {"driver", "ticket"}
+            status_prefix_parts: List[str] = []
+            if drivable_line:
+                status_prefix_parts.append(drivable_line)
+            else:
+                if drivable_status is True:
+                    status_prefix_parts.append("Thanks for confirming the car can still drive.")
+                elif drivable_status is False:
+                    status_prefix_parts.append("Got it - thanks for confirming the car isn't drivable.")
+            if towing_line:
+                status_prefix_parts.append(towing_line)
+                ticket_ctx["_towing_info_sent"] = True
+            if workshop_ref and workshop_from_driver:
+                status_prefix_parts.append(f"I've noted you're heading to {workshop_ref}. Drive safely.")
+            status_prefix = " ".join(status_prefix_parts).strip()
+            workshop_for_location = None
+            if workshop_ref and (drivable_status is True or workshop_from_driver):
+                workshop_for_location = workshop_ref
+            if workshop_for_location:
+                location_line = f"then drop a pin or address once you arrive at {workshop_for_location}."
+            else:
+                location_line = "then drop a pin or address so the ops team knows where to find the car."
+            if drivable_status is True:
+                body = (
+                    "I've logged this for the workshop. Please send one clear photo of the issue with a short note about any warning lights, "
+                    f"{location_line}"
+                )
+            else:
+                body = (
+                    "I've logged this for the workshop. Please park safely and send one clear photo of the issue with a short note about any warning lights, "
+                    f"{location_line}"
+                )
+            if status_prefix:
+                body = f"{status_prefix} {body}"
+            ctx["_car_ticket"] = ticket_ctx
+            if towing_line and ticket_id and not ctx.get("_towing_followup_scheduled"):
+                vehicle_label_parts = [part for part in [vehicle_company, vehicle_model_display] if part]
+                vehicle_label = " ".join(vehicle_label_parts).strip() or None
+                vehicle_reg = (d.get("car_reg_number") or ticket_ctx.get("vehicle_reg")) or None
+                ctx["_towing_followup_scheduled"] = True
+                ctx["_towing_followup_ticket_id"] = ticket_id
+                ctx["_towing_followup_scheduled_at"] = time.time()
+                _schedule_towing_followup(
+                    wa_id=wa_id,
+                    ticket_id=ticket_id,
+                    vehicle_label=vehicle_label,
+                    vehicle_registration=vehicle_reg,
+                    policy_number=ticket_ctx.get("policy_number"),
+                )
+            body = _append_ticket_reference(body, ticket_id, "car_problem")
             return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
 
         ctx["_active_concern"] = {"type": "car", "opened_at": ticket_ctx.get("opened_at", time.time()), "message": msg}
@@ -15674,6 +22166,52 @@ def build_reply(
             else:
                 body = "Just give me a quick yes if it’s resolved so I can close the workshop ticket, otherwise share what’s still happening."
                 return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
+
+        if drivable_status is not None:
+            ticket_ctx["car_drivable"] = bool(drivable_status)
+        if workshop_ref:
+            ticket_ctx["_workshop_reference"] = workshop_ref
+        if disk_model:
+            ticket_ctx["vehicle_model"] = disk_model
+        elif vehicle_model and not ticket_ctx.get("vehicle_model"):
+            ticket_ctx["vehicle_model"] = vehicle_model
+        if disk_company:
+            ticket_ctx["vehicle_company"] = disk_company
+        elif vehicle_company and not ticket_ctx.get("vehicle_company"):
+            ticket_ctx["vehicle_company"] = vehicle_company
+        towing_line = None
+        towing_policy_number = None
+        prev_policy_number = ticket_ctx.get("policy_number")
+        vehicle_reg_for_line = (d.get("car_reg_number") or ticket_ctx.get("vehicle_reg")) or None
+        if drivable_status is False or policy_request:
+            towing_line, towing_policy_number = _build_car_towing_line(
+                vehicle_model=vehicle_model_display,
+                vehicle_company=vehicle_company,
+                vehicle_registration=vehicle_reg_for_line,
+            )
+            if towing_policy_number and towing_policy_number != prev_policy_number:
+                ticket_ctx["policy_number"] = towing_policy_number
+            policy_prompt_needed = policy_request and not towing_policy_number
+            if ticket_ctx.get("_towing_info_sent") and not (
+                towing_policy_number and towing_policy_number != prev_policy_number
+            ) and not policy_prompt_needed:
+                towing_line = None
+        if not towing_policy_number and (towing_line or policy_request):
+            if _license_disk_guide_available() and not ticket_ctx.get("_license_disk_guide_sent"):
+                ticket_ctx["_license_disk_guide_pending"] = True
+        if ticket_id:
+            metadata_patch = _build_car_ticket_metadata_patch(
+                msg=msg,
+                drivable_status=drivable_status,
+                workshop_ref=workshop_ref,
+                workshop_source=workshop_source,
+                vehicle_model=vehicle_model_display,
+                vehicle_company=vehicle_company,
+                policy_number=towing_policy_number,
+                workshop_info=model_workshop,
+            )
+            if metadata_patch:
+                update_driver_issue_metadata(ticket_id, metadata_patch)
 
         awaiting_media = bool(ticket_ctx.get("awaiting_media", True))
         awaiting_location = bool(ticket_ctx.get("awaiting_location", True))
@@ -15737,6 +22275,39 @@ def build_reply(
 
         ticket_ctx["awaiting_media"] = awaiting_media
         ticket_ctx["awaiting_location"] = awaiting_location
+        workshop_from_driver = workshop_source in {"driver", "ticket"}
+        drivable_line = None
+        if drivable_status is None:
+            if workshop_question or not ticket_ctx.get("_drivable_prompted"):
+                if workshop_from_driver and not workshop_question:
+                    drivable_line = "Can you still drive the car safely?"
+                else:
+                    drivable_line = _build_car_drivable_line(
+                        None,
+                        workshop_label=workshop_hint,
+                        vehicle_model=vehicle_model_display,
+                        question=True,
+                    )
+                ticket_ctx["_drivable_prompted"] = True
+        elif drivable_status is True:
+            if workshop_source not in {"driver", "ticket"} and (workshop_question or not ticket_ctx.get("_workshop_advised")):
+                drivable_line = _build_car_drivable_line(
+                    True,
+                    workshop_label=workshop_ref or workshop_hint,
+                    vehicle_model=vehicle_model_display,
+                )
+                ticket_ctx["_workshop_advised"] = True
+        elif drivable_status is False:
+            if not ticket_ctx.get("_drivable_warned"):
+                drivable_line = _build_car_drivable_line(
+                    False,
+                    workshop_label=None,
+                    vehicle_model=vehicle_model_display,
+                )
+                ticket_ctx["_drivable_warned"] = True
+        workshop_for_location = None
+        if workshop_ref and (drivable_status is True or workshop_from_driver):
+            workshop_for_location = workshop_ref
         ctx["_car_ticket"] = ticket_ctx
 
         if not awaiting_media and not awaiting_location:
@@ -15751,7 +22322,24 @@ def build_reply(
             body = (
                 "Perfect—I've added those details and flagged the ops team. They'll reach out once the workshop is lined up."
             )
+            if towing_line:
+                body = f"{towing_line} {body}".strip()
             return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
+
+        status_prefix_parts: List[str] = []
+        if drivable_line:
+            status_prefix_parts.append(drivable_line)
+        else:
+            if drivable_status is True:
+                status_prefix_parts.append("Thanks for confirming the car can still drive.")
+            elif drivable_status is False:
+                status_prefix_parts.append("Got it - thanks for confirming the car isn't drivable.")
+        if towing_line:
+            status_prefix_parts.append(towing_line)
+            ticket_ctx["_towing_info_sent"] = True
+        if workshop_ref and workshop_from_driver:
+            status_prefix_parts.append(f"I've noted you're heading to {workshop_ref}. Drive safely.")
+        status_prefix = " ".join(status_prefix_parts).strip()
 
         ack_bits: List[str] = []
         if received_media:
@@ -15776,15 +22364,26 @@ def build_reply(
 
         if confirm_prefix:
             ack = confirm_prefix + ack
+        if status_prefix:
+            ack = f"{status_prefix} {ack}".strip()
 
         if awaiting_media and awaiting_location:
-            ask = (
-                "Could you send a clear photo of the issue—like the leak, damage, or warning light—and drop a pin or address for where the car is parked?"
-            )
+            if workshop_for_location:
+                ask = (
+                    f"Could you send a clear photo of the issue - like the leak, damage, or warning light - and once you arrive at {workshop_for_location}, "
+                    "please drop a pin or share the address?"
+                )
+            else:
+                ask = (
+                    "Could you send a clear photo of the issue—like the leak, damage, or warning light—and drop a pin or address for where the car is parked?"
+                )
         elif awaiting_media:
             ask = "Could you send a clear photo showing the problem (leak, damage, warning light) so the workshop can prep parts?"
         else:
-            ask = "Could you drop a pin or share the address where the car is parked so ops can reach you?"
+            if workshop_for_location:
+                ask = f"Could you drop a pin or share the address for {workshop_for_location} once you arrive?"
+            else:
+                ask = "Could you drop a pin or share the address where the car is parked so ops can reach you?"
 
         body = ack + ask
         return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
@@ -16020,7 +22619,16 @@ def build_reply(
                 targets["online_hours"] = min_hours
             if targets.get("trip_count") and targets["trip_count"] < min_trips:
                 targets["trip_count"] = min_trips
+        driver_account_issue = not metrics and _is_driver_account_issue_reason(reason)
         if intent not in {"hotspot_summary", "daily_target_status"}:
+            if driver_account_issue:
+                body = (
+                    "I can’t find a driver account linked to this number yet, so I’m unable to pull your stats. "
+                    "Please share your personal code (South African ID or TRN) or ask Ops to link this number so we can resume."
+                )
+                if intraday_opted:
+                    body = f"{body} Bi-hourly updates are on; reply 'stop updates' to pause."
+                return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
             if _is_no_trips_metrics(metrics) or (not metrics and _is_missing_kpi_reason(reason)):
                 body = _kpi_no_trips_commitment_message(targets)
                 if intraday_opted:
@@ -16112,7 +22720,7 @@ def build_reply(
         return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
 
     if intent == "balance_dispute":
-        login_url = "https://60b9b868ac0b.ngrok-free.app/driver/login"
+        login_url = "mynextcar.ngrok.io/driver/login"
         ctx["_active_concern"] = {"type": "balance_dispute", "opened_at": time.time(), "message": msg}
         ticket_ctx = ctx.get("_balance_dispute_ticket") if isinstance(ctx.get("_balance_dispute_ticket"), dict) else None
         if ticket_ctx and _ticket_ctx_is_closed(ticket_ctx, ctx):
@@ -16151,6 +22759,7 @@ def build_reply(
                     "opened_at": time.time(),
                     "issue_type": "balance_dispute",
                 }
+        ticket_issue_type = issue_type or "balance_dispute"
         detail_text = (msg or "").strip()
         pc = extract_personal_code(detail_text)
         if pc and "personal_code" not in ctx:
@@ -16174,6 +22783,7 @@ def build_reply(
                 return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
             ctx["_balance_dispute_pending"] = False
             body = "Thanks, I’ve added that to your Finance ticket. We’ll review and get back to you."
+            body = _append_ticket_reference(body, ticket_id, ticket_issue_type)
             return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
 
         ctx["_balance_dispute_pending"] = True
@@ -16189,22 +22799,82 @@ def build_reply(
                 "Please send your personal code and a short note of what looks wrong (amount/date). "
                 f"You can also check your statement here: {login_url}."
             )
+        body = _append_ticket_reference(body, ticket_id, ticket_issue_type)
         return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
 
-    # account inquiry (send login link + personal code guidance)
-    if intent == "account_inquiry":
-        login_url = "https://60b9b868ac0b.ngrok-free.app/driver/login"
-        if template_amount:
+    if intent == ACCOUNT_STATEMENT_INTENT:
+        log.info(
+            "Handling account_statement_request for %s (personal_code_confirmed=%s)",
+            wa_id,
+            ctx.get("_personal_code_confirmed"),
+        )
+        ctx["_account_statement_requested"] = True
+        login_url = "mynextcar.ngrok.io/driver/login"
+        if not ctx.get("_personal_code_confirmed"):
+            ctx["_awaiting_personal_code"] = True
             body = (
-                f"The outstanding balance I mentioned is {template_amount}. "
-                f"For the latest balance, please log in here: {login_url}. "
-                "Use your personal code (South African ID number, or Traffic Register Number (TRN) for foreign nationals from your PrDP)."
+                "Before I confirm your account details, please send your personal code. "
+                "That's your South African ID number or the Traffic Registration Number (TRN) from your PrDP."
             )
             return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
-        body = (
-            f"You can check your account balance here: {login_url}. "
-            "Please use your personal code (South African ID number, or Traffic Register Number (TRN) for foreign nationals from your PrDP)."
+        body = _compose_account_statement_body(ctx, d, template_amount)
+        return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
+
+    if intent == ACCOUNT_BALANCE_INTENT:
+        login_url = "mynextcar.ngrok.io/driver/login"
+        balance_line = _build_driver_kpi_balance_line(wa_id)
+        suffix = (
+            f"For more account info, log in at {login_url} using your personal code "
+            "(South African ID number or TRN for foreign nationals). "
+            "If you meant a full statement, say 'statement' or 'account statement'."
         )
+        body = f"{balance_line or 'I can’t pull the KPI snapshot right now.'} {suffix}"
+        return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
+
+    if intent == "account_inquiry":
+        login_url = "mynextcar.ngrok.io/driver/login"
+        body = (
+            f"You can check your account info at {login_url} using your personal code "
+            "(South African ID number or TRN for foreign nationals). "
+            "Say 'balance' or 'account balance' if you want me to confirm your payable amount, "
+            "or say 'statement' to fetch the detailed statement."
+        )
+        return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
+
+    issue_entry = _issue_config_entry(intent)
+    if issue_entry:
+        ctx_key = f"_issue_ticket_{_normalize_issue_key(intent)}"
+        ticket_id = _ensure_issue_ticket(
+            ctx,
+            wa_id,
+            msg or _issue_type_label(intent),
+            d,
+            issue_type=intent,
+            ctx_key=ctx_key,
+            existing_types=[intent],
+        )
+        if ticket_id and isinstance(ctx.get(ctx_key), dict):
+            ctx[ctx_key]["issue_type"] = _normalize_issue_key(intent)
+        ctx["_active_concern"] = {
+            "type": _normalize_issue_key(intent),
+            "opened_at": time.time(),
+            "message": msg,
+        }
+        instructions = _sanitize_issue_instructions(issue_entry.get("instructions"))
+        if ticket_id:
+            metadata_patch: Dict[str, Any] = {}
+            keywords = _sanitize_issue_keywords(issue_entry.get("keywords"))
+            if keywords:
+                metadata_patch["issue_keywords"] = keywords
+            if instructions:
+                metadata_patch["issue_instructions"] = instructions
+            if metadata_patch:
+                update_driver_issue_metadata(ticket_id, metadata_patch)
+        if instructions:
+            body = f"Thanks for the update. {instructions}"
+        else:
+            body = "Thanks for the update — I’ve logged this with the team and will follow up."
+        body = _append_ticket_reference(body, ticket_id, intent)
         return soften_reply(_strip_leading_greeting_or_name(body, d.get("display_name") or "", name), name)
 
     if intent in {"fallback", "clarify", "unknown"} and template_amount and _should_use_template_context(msg):
@@ -16269,6 +22939,10 @@ def log_status_event(*, status_event: dict, business_number: str, phone_number_i
 # FastAPI
 # -----------------------------------------------------------------------------
 app = FastAPI(title="Dineo WA Bot (JHB + schema-aware logging)")
+if STATIC_DIR.exists():
+    app.mount(STATIC_URL_PREFIX, StaticFiles(directory=str(STATIC_DIR)), name="static")
+else:
+    log.warning("Static directory not found: %s", STATIC_DIR)
 
 @app.on_event("startup")
 async def _startup_zero_trip_worker():
@@ -16286,6 +22960,10 @@ async def _startup_zero_trip_worker():
         _start_intraday_updates_worker()
     except Exception as exc:
         log.warning("Intraday updates worker not started: %s", exc)
+    try:
+        _start_gmail_auto_sync_worker()
+    except Exception as exc:
+        log.warning("Gmail auto-sync worker not started: %s", exc)
 
 
 async def _bootstrap_schema_startup():
@@ -16399,7 +23077,7 @@ def admin_summary(request: Request):
             "admin": admin_user,
             "driver_summary": driver_summary,
             "payer_summary": payer_summary,
-            "nav_active": "drivers",
+        "nav_active": "summary",
             "total_drivers": total,
             "format_rands": fmt_rands,
             "collections_options": collections_options,
@@ -16410,6 +23088,340 @@ def admin_summary(request: Request):
             "selected_status": selected_status,
         },
     )
+
+
+@app.get("/admin/sla", response_class=HTMLResponse)
+def admin_sla(request: Request):
+    admin_user = get_authenticated_admin(request)
+    if not admin_user:
+        return _redirect_to_login()
+    message = request.query_params.get("msg")
+    message_text = None
+    message_kind = "info"
+    if message == "updated":
+        message_text = "SLA targets updated."
+        message_kind = "success"
+    elif message == "added":
+        message_text = "SLA status added."
+        message_kind = "success"
+    elif message == "invalid":
+        message_text = "Please provide a valid status and SLA hours."
+        message_kind = "error"
+    elif message == "save_error":
+        message_text = "Could not save SLA settings."
+        message_kind = "error"
+    elif message == "deleted":
+        message_text = "SLA status deleted."
+        message_kind = "success"
+
+    status_options = get_ticket_status_options(limit=50)
+    seen: set[str] = set()
+    ordered_statuses: List[str] = []
+    for status in status_options + list(TICKET_SLA_HOURS_BY_STATUS.keys()):
+        key = _normalize_status_value(status)
+        if not key or key in seen:
+            continue
+        if key not in TICKET_SLA_HOURS_BY_STATUS:
+            continue
+        seen.add(key)
+        ordered_statuses.append(key)
+
+    sla_rows = []
+    for status in ordered_statuses:
+        hours = TICKET_SLA_HOURS_BY_STATUS.get(status)
+        sla_rows.append(
+            {
+                "status": status,
+                "label": _status_label(status),
+                "hours": "" if hours is None else hours,
+                "is_disabled": hours in (None, 0),
+            }
+        )
+
+    return templates.TemplateResponse(
+        "admin_sla.html",
+        {
+            "request": request,
+            "admin": admin_user,
+            "sla_rows": sla_rows,
+            "status_options": status_options,
+            "message_text": message_text,
+            "message_kind": message_kind,
+            "nav_active": "sla",
+        },
+    )
+
+
+@app.post("/admin/sla/update", response_class=HTMLResponse)
+async def admin_sla_update(request: Request):
+    admin_user = get_authenticated_admin(request)
+    if not admin_user:
+        return _redirect_to_login()
+    global TICKET_SLA_HOURS_BY_STATUS
+    form = await request.form()
+    statuses = form.getlist("status")
+    hours_list = form.getlist("hours")
+    if not statuses or len(statuses) != len(hours_list):
+        return RedirectResponse(url="/admin/sla?msg=invalid", status_code=303)
+    updated: Dict[str, float] = {}
+    for status, hours in zip(statuses, hours_list):
+        status_key = _normalize_status_value(status)
+        if not status_key:
+            continue
+        sla_hours = _sanitize_sla_hours(hours)
+        if sla_hours is None:
+            sla_hours = 0
+        updated[status_key] = sla_hours
+    if not updated:
+        return RedirectResponse(url="/admin/sla?msg=invalid", status_code=303)
+    ok = _persist_ticket_sla_config(updated)
+    if not ok:
+        return RedirectResponse(url="/admin/sla?msg=save_error", status_code=303)
+    TICKET_SLA_HOURS_BY_STATUS = updated
+    return RedirectResponse(url="/admin/sla?msg=updated", status_code=303)
+
+
+@app.post("/admin/sla/add", response_class=HTMLResponse)
+async def admin_sla_add(request: Request, status: str = Form(...), hours: str = Form(...)):
+    admin_user = get_authenticated_admin(request)
+    if not admin_user:
+        return _redirect_to_login()
+    global TICKET_SLA_HOURS_BY_STATUS
+    status_key = _normalize_status_value(status)
+    sla_hours = _sanitize_sla_hours(hours)
+    if not status_key or sla_hours is None:
+        return RedirectResponse(url="/admin/sla?msg=invalid", status_code=303)
+    updated = dict(TICKET_SLA_HOURS_BY_STATUS)
+    updated[status_key] = sla_hours
+    ok = _persist_ticket_sla_config(updated)
+    if not ok:
+        return RedirectResponse(url="/admin/sla?msg=save_error", status_code=303)
+    TICKET_SLA_HOURS_BY_STATUS = updated
+    return RedirectResponse(url="/admin/sla?msg=added", status_code=303)
+
+
+@app.post("/admin/sla/delete", response_class=HTMLResponse)
+async def admin_sla_delete(
+    request: Request,
+    status: Optional[str] = Form(None),
+    delete_status: Optional[str] = Form(None),
+):
+    admin_user = get_authenticated_admin(request)
+    if not admin_user:
+        return _redirect_to_login()
+    global TICKET_SLA_HOURS_BY_STATUS
+    status_key = _normalize_status_value(delete_status or status)
+    if not status_key:
+        return RedirectResponse(url="/admin/sla?msg=invalid", status_code=303)
+    if status_key not in TICKET_SLA_HOURS_BY_STATUS:
+        return RedirectResponse(url="/admin/sla?msg=invalid", status_code=303)
+    updated = dict(TICKET_SLA_HOURS_BY_STATUS)
+    updated.pop(status_key, None)
+    ok = _persist_ticket_sla_config(updated)
+    if not ok:
+        return RedirectResponse(url="/admin/sla?msg=save_error", status_code=303)
+    TICKET_SLA_HOURS_BY_STATUS = updated
+    return RedirectResponse(url="/admin/sla?msg=deleted", status_code=303)
+
+
+@app.get("/admin/issues", response_class=HTMLResponse)
+def admin_issues(request: Request):
+    admin_user = get_authenticated_admin(request)
+    if not admin_user:
+        return _redirect_to_login()
+    message = request.query_params.get("msg")
+    message_text = None
+    message_kind = "info"
+    if message == "created":
+        message_text = "Issue created."
+        message_kind = "success"
+    elif message == "updated":
+        message_text = "Issue updated."
+        message_kind = "success"
+    elif message == "deleted":
+        message_text = "Issue deleted."
+        message_kind = "success"
+    elif message == "invalid":
+        message_text = "Please provide a valid issue label or key."
+        message_kind = "error"
+    elif message == "save_error":
+        message_text = "Could not save issue settings."
+        message_kind = "error"
+
+    status_options = get_ticket_status_options()
+    issues: List[Dict[str, Any]] = []
+    for key, payload in ISSUE_TYPES_CONFIG.items():
+        payload = _issue_payload_from_value(key, payload)
+        label = payload.get("label") or _issue_label_from_key(key)
+        active = payload.get("active")
+        statuses = _sanitize_issue_statuses(payload.get("statuses"))
+        keywords = _sanitize_issue_keywords(payload.get("keywords"))
+        instructions = _sanitize_issue_instructions(payload.get("instructions"))
+        plan = _build_issue_instruction_plan(instructions)
+        issues.append(
+            {
+                "key": key,
+                "label": str(label),
+                "active": True if active is None else bool(active),
+                "statuses": statuses,
+                "keywords": keywords,
+                "keywords_text": _format_issue_keywords(keywords),
+                "instructions": instructions,
+                "driver_instructions": plan.get("driver_prompt", ""),
+                "ops_instructions": plan.get("ops_instructions", ""),
+                "instruction_emails": ", ".join(plan.get("email_addresses") or []),
+            }
+        )
+    issues.sort(key=lambda item: (item.get("active") is False, str(item.get("label") or item.get("key") or "")))
+
+    return templates.TemplateResponse(
+        "admin_issues.html",
+        {
+            "request": request,
+            "admin": admin_user,
+            "issues": issues,
+            "status_options": status_options,
+            "message_text": message_text,
+            "message_kind": message_kind,
+            "nav_active": "issues",
+        },
+    )
+
+
+@app.post("/admin/issues/create", response_class=HTMLResponse)
+async def admin_issues_create(
+    request: Request,
+    label: str = Form(""),
+    key: str = Form(""),
+):
+    admin_user = get_authenticated_admin(request)
+    if not admin_user:
+        return _redirect_to_login()
+    global ISSUE_TYPES_CONFIG
+    form = await request.form()
+    statuses = form.getlist("statuses")
+    keywords = _sanitize_issue_keywords(form.get("keywords"))
+    driver_instructions = form.get("driver_instructions")
+    ops_instructions = form.get("ops_instructions")
+    instructions = _combine_issue_instructions(driver_instructions, ops_instructions)
+    if not instructions:
+        instructions = _sanitize_issue_instructions(form.get("instructions"))
+    raw_label = (label or "").strip()
+    raw_key = (key or "").strip()
+    issue_key = _normalize_issue_key(raw_key or raw_label)
+    if not issue_key:
+        return RedirectResponse(url="/admin/issues?msg=invalid", status_code=303)
+    issue_label = raw_label or _issue_label_from_key(issue_key)
+    status_list = _sanitize_issue_statuses(statuses)
+
+    updated: Dict[str, Dict[str, Any]] = {
+        k: _issue_payload_from_value(k, v)
+        for k, v in ISSUE_TYPES_CONFIG.items()
+    }
+    exists = issue_key in updated
+    updated[issue_key] = {
+        "label": issue_label,
+        "active": True,
+        "statuses": status_list,
+        "keywords": keywords,
+        "instructions": instructions,
+    }
+    ok = _persist_issue_config(updated)
+    if not ok:
+        return RedirectResponse(url="/admin/issues?msg=save_error", status_code=303)
+    ISSUE_TYPES_CONFIG = updated
+    return RedirectResponse(url=f"/admin/issues?msg={'updated' if exists else 'created'}", status_code=303)
+
+
+@app.post("/admin/issues/toggle", response_class=HTMLResponse)
+async def admin_issues_toggle(
+    request: Request,
+    key: str = Form(...),
+    active: str = Form("1"),
+):
+    admin_user = get_authenticated_admin(request)
+    if not admin_user:
+        return _redirect_to_login()
+    global ISSUE_TYPES_CONFIG
+    issue_key = _normalize_issue_key(key)
+    if not issue_key:
+        return RedirectResponse(url="/admin/issues?msg=invalid", status_code=303)
+    try:
+        active_flag = bool(int(str(active).strip()))
+    except Exception:
+        active_flag = True
+    updated: Dict[str, Dict[str, Any]] = {
+        k: _issue_payload_from_value(k, v)
+        for k, v in ISSUE_TYPES_CONFIG.items()
+    }
+    payload = updated.get(issue_key, _issue_payload_from_value(issue_key, {}))
+    payload["active"] = active_flag
+    payload["label"] = str(payload.get("label") or _issue_label_from_key(issue_key))
+    updated[issue_key] = payload
+    ok = _persist_issue_config(updated)
+    if not ok:
+        return RedirectResponse(url="/admin/issues?msg=save_error", status_code=303)
+    ISSUE_TYPES_CONFIG = updated
+    return RedirectResponse(url="/admin/issues?msg=updated", status_code=303)
+
+
+@app.post("/admin/issues/update", response_class=HTMLResponse)
+async def admin_issues_update(request: Request, key: str = Form(...)):
+    admin_user = get_authenticated_admin(request)
+    if not admin_user:
+        return _redirect_to_login()
+    global ISSUE_TYPES_CONFIG
+    form = await request.form()
+    issue_key = _normalize_issue_key(key)
+    if not issue_key:
+        return RedirectResponse(url="/admin/issues?msg=invalid", status_code=303)
+    statuses = _sanitize_issue_statuses(form.getlist("statuses"))
+    keywords = _sanitize_issue_keywords(form.get("keywords"))
+    driver_instructions = form.get("driver_instructions")
+    ops_instructions = form.get("ops_instructions")
+    instructions = _combine_issue_instructions(driver_instructions, ops_instructions)
+    if not instructions:
+        instructions = _sanitize_issue_instructions(form.get("instructions"))
+
+    updated: Dict[str, Dict[str, Any]] = {
+        k: _issue_payload_from_value(k, v)
+        for k, v in ISSUE_TYPES_CONFIG.items()
+    }
+    payload = updated.get(issue_key, _issue_payload_from_value(issue_key, {}))
+    payload["statuses"] = statuses
+    payload["keywords"] = keywords
+    payload["instructions"] = instructions
+    payload["label"] = str(payload.get("label") or _issue_label_from_key(issue_key))
+    updated[issue_key] = payload
+    ok = _persist_issue_config(updated)
+    if not ok:
+        return RedirectResponse(url="/admin/issues?msg=save_error", status_code=303)
+    ISSUE_TYPES_CONFIG = updated
+    return RedirectResponse(url="/admin/issues?msg=updated", status_code=303)
+
+
+@app.post("/admin/issues/delete", response_class=HTMLResponse)
+async def admin_issues_delete(request: Request, key: str = Form(...)):
+    admin_user = get_authenticated_admin(request)
+    if not admin_user:
+        return _redirect_to_login()
+    global ISSUE_TYPES_CONFIG
+    issue_key = _normalize_issue_key(key)
+    if not issue_key:
+        return RedirectResponse(url="/admin/issues?msg=invalid", status_code=303)
+    updated: Dict[str, Dict[str, Any]] = {
+        k: _issue_payload_from_value(k, v)
+        for k, v in ISSUE_TYPES_CONFIG.items()
+    }
+    if issue_key in updated:
+        updated.pop(issue_key, None)
+    else:
+        return RedirectResponse(url="/admin/issues?msg=invalid", status_code=303)
+    ok = _persist_issue_config(updated)
+    if not ok:
+        return RedirectResponse(url="/admin/issues?msg=save_error", status_code=303)
+    ISSUE_TYPES_CONFIG = updated
+    return RedirectResponse(url="/admin/issues?msg=deleted", status_code=303)
 
 
 def _build_engagement_preview_rows(
@@ -17408,6 +24420,268 @@ def admin_collections_progress(request: Request, campaign_id: str):
     return JSONResponse(entry)
 
 
+async def _extract_pause_reason(
+    request: Request,
+    explicit_reason: Optional[str],
+) -> Optional[str]:
+    candidate = (explicit_reason or "").strip()
+    if candidate:
+        return candidate
+    query_reason = (request.query_params.get("reason") or "").strip()
+    if query_reason:
+        return query_reason
+    content_type = (request.headers.get("content-type") or "").lower()
+    if "application/json" in content_type:
+        try:
+            payload = await request.json()
+            if isinstance(payload, dict):
+                payload_reason = (payload.get("reason") or "").strip()
+                if payload_reason:
+                    return payload_reason
+        except Exception:
+            pass
+    if "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
+        try:
+            form = await request.form()
+            form_reason = (form.get("reason") or "").strip()
+            if form_reason:
+                return form_reason
+        except Exception:
+            pass
+    return None
+
+
+async def _pause_campaign_endpoint(
+    request: Request,
+    campaign_id: str,
+    pause_handler: Callable[[str, Optional[str]], int],
+    *,
+    explicit_reason: Optional[str] = None,
+) -> JSONResponse:
+    admin_user = get_authenticated_admin(request)
+    if not admin_user:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    reason = await _extract_pause_reason(request, explicit_reason)
+    effective_reason = reason or f"Campaign {campaign_id} paused"
+    paused = pause_handler(campaign_id, reason=effective_reason)
+    status_set = _set_engagement_campaign_status(campaign_id, "paused", reason=effective_reason)
+    payload = {
+        "campaign_id": campaign_id,
+        "paused": paused,
+        "status": "paused",
+        "status_updated": status_set,
+        "reason": effective_reason,
+    }
+    return _engagement_status_response(request, payload, campaign_id)
+
+
+@app.post("/admin/engagements/{campaign_id}/pause")
+async def admin_engagement_pause(
+    request: Request,
+    campaign_id: str,
+    reason: Optional[str] = None,
+):
+    return await _pause_campaign_endpoint(
+        request,
+        campaign_id,
+        _pause_engagement_campaign_drivers,
+        explicit_reason=reason,
+    )
+
+
+@app.post("/admin/collections-ai/{campaign_id}/pause")
+async def admin_collections_pause(
+    request: Request,
+    campaign_id: str,
+    reason: Optional[str] = None,
+):
+    return await _pause_campaign_endpoint(
+        request,
+        campaign_id,
+        _pause_engagement_campaign_drivers,
+        explicit_reason=reason,
+    )
+
+
+async def _activate_campaign_endpoint(
+    request: Request,
+    campaign_id: str,
+    activate_handler: Callable[[str], int],
+) -> JSONResponse:
+    admin_user = get_authenticated_admin(request)
+    if not admin_user:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    activated = activate_handler(campaign_id)
+    status_set = _set_engagement_campaign_status(campaign_id, "active")
+    payload = {
+        "campaign_id": campaign_id,
+        "activated": activated,
+        "status": "active",
+        "status_updated": status_set,
+    }
+    return _engagement_status_response(request, payload, campaign_id)
+
+
+def _normalize_engagement_status_value(value: Optional[Any]) -> Optional[str]:
+    if value is None:
+        return None
+    candidate = str(value).strip().lower()
+    if not candidate:
+        return None
+    if candidate in {
+        "active",
+        "activate",
+        "resume",
+        "running",
+        "start",
+        "on",
+        "enabled",
+    }:
+        return "active"
+    if candidate in {
+        "paused",
+        "pause",
+        "deactivate",
+        "deactivated",
+        "stop",
+        "off",
+        "disabled",
+    }:
+        return "paused"
+    return None
+
+
+async def _parse_engagement_status_request(
+    request: Request,
+) -> Tuple[Optional[str], Optional[str]]:
+    status_candidate: Optional[str] = None
+    reason: Optional[str] = None
+    query_status = request.query_params.get("status") or request.query_params.get("action")
+    if query_status:
+        status_candidate = query_status
+    query_reason = (request.query_params.get("reason") or "").strip()
+    if query_reason:
+        reason = query_reason
+    content_type = (request.headers.get("content-type") or "").lower()
+    if "application/json" in content_type:
+        try:
+            payload = await request.json()
+            if isinstance(payload, dict):
+                if not status_candidate:
+                    status_candidate = payload.get("status") or payload.get("action")
+                if not reason:
+                    payload_reason = payload.get("reason")
+                    if payload_reason:
+                        reason = str(payload_reason).strip()
+        except Exception:
+            pass
+    if status_candidate and not reason and reason != "":
+        reason = reason or None
+    if (
+        "application/x-www-form-urlencoded" in content_type
+        or "multipart/form-data" in content_type
+    ):
+        try:
+            form = await request.form()
+            if not status_candidate:
+                status_candidate = form.get("status") or form.get("action")
+            if not reason:
+                form_reason = form.get("reason")
+                if form_reason:
+                    reason = str(form_reason).strip()
+        except Exception:
+            pass
+    if status_candidate:
+        normalized = _normalize_engagement_status_value(status_candidate)
+    else:
+        normalized = None
+    return normalized, reason
+
+
+async def _update_engagement_campaign_status_endpoint(
+    request: Request,
+    campaign_id: str,
+) -> JSONResponse:
+    admin_user = get_authenticated_admin(request)
+    if not admin_user:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    status_candidate, reason = await _parse_engagement_status_request(request)
+    if not status_candidate:
+        return JSONResponse({"error": "invalid status"}, status_code=400)
+    if status_candidate == "paused":
+        effective_reason = reason or f"Campaign {campaign_id} paused"
+        paused = _pause_engagement_campaign_drivers(campaign_id, reason=effective_reason)
+        status_set = _set_engagement_campaign_status(campaign_id, "paused", reason=effective_reason)
+        payload = {
+            "campaign_id": campaign_id,
+            "status": "paused",
+            "paused": paused,
+            "status_updated": status_set,
+            "reason": effective_reason,
+        }
+    else:
+        activated = _resume_engagement_campaign_drivers(campaign_id)
+        status_set = _set_engagement_campaign_status(campaign_id, "active")
+        payload = {
+            "campaign_id": campaign_id,
+            "status": "active",
+            "activated": activated,
+            "status_updated": status_set,
+        }
+    return _engagement_status_response(request, payload, campaign_id)
+
+
+def _engagement_status_response(request: Request, payload: Dict[str, Any], campaign_id: str) -> JSONResponse:
+    headers: Dict[str, str] = {}
+    referer = request.headers.get("referer")
+    if referer:
+        headers["HX-Redirect"] = referer
+    else:
+        headers["HX-Redirect"] = _engagement_campaign_base_path(_fetch_engagement_campaign(campaign_id).get("campaign_type") if _fetch_engagement_campaign(campaign_id) else ENGAGEMENT_CAMPAIGN_TYPE_PERFORMANCE)
+    headers["HX-Refresh"] = "true"
+    return JSONResponse(payload, headers=headers)
+
+
+@app.post("/admin/engagements/{campaign_id}/activate")
+async def admin_engagement_activate(
+    request: Request,
+    campaign_id: str,
+):
+    return await _activate_campaign_endpoint(
+        request,
+        campaign_id,
+        _resume_engagement_campaign_drivers,
+    )
+
+
+@app.post("/admin/collections-ai/{campaign_id}/activate")
+async def admin_collections_activate(
+    request: Request,
+    campaign_id: str,
+):
+    return await _activate_campaign_endpoint(
+        request,
+        campaign_id,
+        _resume_engagement_campaign_drivers,
+    )
+
+
+@app.post("/admin/engagements/{campaign_id}/status")
+async def admin_engagement_status(
+    request: Request,
+    campaign_id: str,
+) -> JSONResponse:
+    return await _update_engagement_campaign_status_endpoint(request, campaign_id)
+
+
+@app.post("/admin/collections-ai/{campaign_id}/status")
+async def admin_collections_status(
+    request: Request,
+    campaign_id: str,
+) -> JSONResponse:
+    return await _update_engagement_campaign_status_endpoint(request, campaign_id)
+
+
 @app.get("/admin/engagements/{campaign_id}", response_class=HTMLResponse)
 def admin_engagement_report(request: Request, campaign_id: str):
     admin_user = get_authenticated_admin(request)
@@ -18050,6 +25324,93 @@ async def admin_users_manage_flag(request: Request, email: str = Form(...), can_
 # -----------------------------------------------------------------------------
 # Driver portal (self-service statement/profile)
 # -----------------------------------------------------------------------------
+@app.get("/driver/signup", response_class=HTMLResponse)
+async def driver_signup_page(request: Request):
+    if get_authenticated_driver(request):
+        return RedirectResponse(url="/driver/profile", status_code=303)
+    error = request.query_params.get("error")
+    success = request.query_params.get("success")
+    logo_url = _logo_data_url()
+    success_flag = success == "1"
+    success_message = "Thanks for applying! We'll review your information and be in touch soon." if success_flag else None
+    form_data: Dict[str, Any] = {}
+    return templates.TemplateResponse(
+        "driver_signup.html",
+        {
+            "request": request,
+            "error": error,
+            "success": success,
+            "form_success": success_flag,
+            "message": success_message,
+            "submitted": form_data,
+            "phone_error": "",
+            "mnc_logo_url": logo_url,
+            "field_errors": {},
+        },
+    )
+
+
+@app.post("/driver/signup", response_class=HTMLResponse)
+async def driver_signup_submit(request: Request):
+    logo_url = _logo_data_url()
+    form = await request.form()
+    form_data = _extract_driver_application_form(form)
+    phone_clean = _normalize_phone_digits(form_data.get("phone_number"))
+    email_normalized = _normalize_email(form_data.get("email"))
+    loop = asyncio.get_running_loop()
+    duplicate = await loop.run_in_executor(
+        None,
+        lambda: _recent_driver_application_entry(phone_clean, email_normalized),
+    )
+    if duplicate:
+        log.info(
+            "Blocked duplicate driver application within dedupe window (phone=%s email=%s)",
+            form_data.get("phone_number"),
+            form_data.get("email"),
+        )
+        return templates.TemplateResponse(
+            "driver_signup.html",
+            {
+                "request": request,
+                "error": "We already have your application. Please wait an hour before submitting again.",
+                "success": None,
+                "submitted": form_data,
+                "mnc_logo_url": logo_url,
+                "field_errors": {},
+            },
+            status_code=429,
+        )
+    inserted_id = await loop.run_in_executor(
+        None,
+        lambda: _insert_driver_application(form_data, phone_clean),
+    )
+    if not inserted_id:
+        log.error(
+            "Driver application insert failed (phone=%s email=%s)",
+            form_data.get("phone_number"),
+            form_data.get("email"),
+        )
+        return templates.TemplateResponse(
+            "driver_signup.html",
+            {
+                "request": request,
+                "error": "We couldn't save your application right now. Please try again later.",
+                "success": None,
+                "submitted": form_data,
+                "mnc_logo_url": logo_url,
+                "field_errors": {},
+            },
+            status_code=500,
+        )
+    log.info(
+        "Stored new driver application (id=%s phone=%s email=%s)",
+        inserted_id,
+        form_data.get("phone_number"),
+        form_data.get("email"),
+    )
+    return RedirectResponse(url="/driver/signup?success=1", status_code=303)
+
+
 @app.get("/driver/login", response_class=HTMLResponse)
 async def driver_login_page(request: Request):
     if get_authenticated_driver(request):
@@ -18532,6 +25893,320 @@ async def admin_list_whatsapp_templates(request: Request):
         return _redirect_to_login()
     return JSONResponse(get_whatsapp_templates())
 
+@app.get("/admin/whatsapp", response_class=HTMLResponse)
+def admin_whatsapp_page(request: Request):
+    admin_user = get_authenticated_admin(request)
+    if not admin_user:
+        return _redirect_to_login()
+    message_key = request.query_params.get("msg")
+    message_text = None
+    message_kind = "info"
+    message_map = {
+        "created": ("Template registered for approval.", "success"),
+        "updated": ("Template details updated.", "success"),
+        "status_updated": ("Template status updated.", "success"),
+        "invalid": ("Provide a valid template ID and name.", "error"),
+        "not_found": ("Template not found.", "error"),
+        "save_error": ("Could not persist template data.", "error"),
+    }
+    if message_key in message_map:
+        message_text, message_kind = message_map[message_key]
+
+    registry = load_whatsapp_template_registry()
+    registry.sort(key=lambda entry: entry.get("updated_at") or "", reverse=True)
+    grouped: Dict[str, List[Dict[str, Any]]] = {status: [] for status in WHATSAPP_TEMPLATE_STATUSES}
+    for entry in registry:
+        entry_status = _normalize_whatsapp_template_status(entry.get("status"))
+        entry["status"] = entry_status
+        entry["meta"] = entry.get("meta") or {}
+        entry["notes"] = entry.get("notes") or ""
+        entry["source"] = entry.get("source") or "manual"
+        grouped.setdefault(entry_status, []).append(entry)
+
+    approved_registry = grouped.get("approved") or []
+    pending_registry = grouped.get("pending") or []
+    declined_registry = grouped.get("declined") or []
+
+    official_templates: List[Dict[str, Any]] = []
+    for template in get_whatsapp_templates():
+        official_templates.append(
+            {
+                "id": template.get("id"),
+                "name": template.get("name"),
+                "description": template.get("description"),
+                "language": template.get("language") or "en",
+                "variables": list(template.get("variables") or []),
+                "status": "approved",
+                "source": "system",
+                "meta": {"parameter_format": template.get("parameter_format") or ""},
+                "notes": template.get("description") or "",
+                "registered_by": "System",
+                "created_at": "",
+                "updated_at": "",
+            }
+        )
+
+    status_options = [
+        {"value": status, "label": status.replace("_", " ").title()}
+        for status in WHATSAPP_TEMPLATE_STATUSES
+    ]
+
+    return templates.TemplateResponse(
+        "admin_whatsapp.html",
+        {
+            "request": request,
+            "admin": admin_user,
+            "message_text": message_text,
+            "message_kind": message_kind,
+            "nav_active": "whatsapp_templates",
+            "official_templates": official_templates,
+            "approved_registry": approved_registry,
+            "pending_registry": pending_registry,
+            "declined_registry": declined_registry,
+            "status_options": status_options,
+            "meta_fields": WHATSAPP_TEMPLATE_META_FIELDS,
+        },
+    )
+
+
+@app.post("/admin/whatsapp/templates/register", response_class=HTMLResponse)
+async def admin_whatsapp_template_register(request: Request):
+    admin_user = get_authenticated_admin(request)
+    if not admin_user:
+        return _redirect_to_login()
+    form = await request.form()
+    variables = _parse_whatsapp_variables(form.get("variables"))
+    ok, message_key = register_whatsapp_template(
+        admin_email=admin_user.get("email") or "admin",
+        template_id=str(form.get("template_id") or ""),
+        name=form.get("name"),
+        description=form.get("description"),
+        language=form.get("language"),
+        variables=variables,
+        sample=form.get("sample"),
+        notes=form.get("notes"),
+        meta=_collect_whatsapp_meta_from_form(form),
+    )
+    redirect_key = message_key
+    return RedirectResponse(url=f"/admin/whatsapp?msg={redirect_key}", status_code=303)
+
+
+@app.post("/admin/whatsapp/templates/{template_id}/status", response_class=HTMLResponse)
+async def admin_whatsapp_template_status(
+    request: Request,
+    template_id: str,
+):
+    admin_user = get_authenticated_admin(request)
+    if not admin_user:
+        return _redirect_to_login()
+    form = await request.form()
+    ok, message_key = update_whatsapp_template_status_record(
+        template_id=template_id,
+        status=form.get("status"),
+        admin_email=admin_user.get("email") or "admin",
+        notes=form.get("notes"),
+    )
+    redirect_key = message_key
+    return RedirectResponse(url=f"/admin/whatsapp?msg={redirect_key}", status_code=303)
+
+
+@app.get("/admin/message-log", response_class=HTMLResponse)
+def admin_message_log_page(request: Request):
+    admin_user = get_authenticated_admin(request)
+    if not admin_user:
+        return _redirect_to_login()
+    channel = (request.query_params.get("channel") or "all").lower()
+    direction = (request.query_params.get("direction") or "").upper()
+    q = (request.query_params.get("q") or "").strip()
+    wa_id_filter = (request.query_params.get("wa_id") or "").strip()
+    email_filter = (request.query_params.get("email") or "").strip()
+    limit = int(request.query_params.get("limit") or 200)
+    date_from = _parse_date_param(request.query_params.get("date_from"))
+    date_to = _parse_date_param(request.query_params.get("date_to"))
+    if q and not wa_id_filter and not email_filter:
+        if "@" in q:
+            email_filter = q
+        else:
+            wa_id_filter = q
+    direction_filter = direction if direction in {"INBOUND", "OUTBOUND"} else None
+    limit_val = max(1, min(limit, 500))
+
+    rows: List[Dict[str, Any]] = []
+    if channel in {"all", "whatsapp"}:
+        wa_rows = fetch_whatsapp_logs(
+            limit=limit_val,
+            direction=direction_filter,
+            wa_id=wa_id_filter or None,
+            date_from=date_from,
+            date_to=date_to,
+        )
+        for row in wa_rows:
+            ts_val = row.get("ts")
+            ts_dt = _parse_log_timestamp(ts_val)
+            rows.append(
+                {
+                    "channel": "whatsapp",
+                    "direction": (row.get("direction") or "").upper(),
+                    "wa_id": row.get("wa_id"),
+                    "email": None,
+                    "subject": None,
+                    "body": row.get("body") or "",
+                    "status": row.get("status"),
+                    "intent": row.get("intent"),
+                    "origin": row.get("origin_type"),
+                    "ticket_id": None,
+                    "timestamp": ts_dt.strftime("%Y-%m-%d %H:%M:%S") if ts_dt else str(ts_val or ""),
+                    "timestamp_dt": ts_dt,
+                }
+            )
+    if channel in {"all", "email"}:
+        email_rows = fetch_email_logs(
+            limit=limit_val,
+            direction=direction_filter,
+            wa_id=wa_id_filter or None,
+            email=email_filter or None,
+            date_from=date_from,
+            date_to=date_to,
+        )
+        for row in email_rows:
+            ts_dt = row.get("created_at") if isinstance(row.get("created_at"), datetime) else _parse_log_timestamp(row.get("created_at"))
+            rows.append(
+                {
+                    "channel": "email",
+                    "direction": (row.get("direction") or "").upper(),
+                    "wa_id": row.get("wa_id"),
+                    "email": row.get("email_address"),
+                    "subject": row.get("subject"),
+                    "body": row.get("body") or "",
+                    "status": row.get("status"),
+                    "intent": None,
+                    "origin": row.get("admin_email"),
+                    "ticket_id": row.get("ticket_id"),
+                    "timestamp": _format_admin_ticket_datetime(row.get("created_at")),
+                    "timestamp_dt": ts_dt,
+                }
+            )
+
+    rows.sort(key=lambda r: r.get("timestamp_dt") or datetime.min, reverse=True)
+    rows = rows[:limit_val]
+
+    message = request.query_params.get("msg")
+    message_text = None
+    message_kind = "info"
+    if message == "sync_ok":
+        message_text = "Gmail inbox synced."
+        message_kind = "success"
+    elif message == "sync_failed":
+        message_text = "Gmail sync failed or is not configured."
+        message_kind = "error"
+
+    return templates.TemplateResponse(
+        "admin_message_log.html",
+        {
+            "request": request,
+            "admin": admin_user,
+            "rows": rows,
+            "channel": channel,
+            "direction": direction_filter or "ALL",
+            "q": q,
+            "wa_id_filter": wa_id_filter,
+            "email_filter": email_filter,
+            "limit_val": limit_val,
+            "date_from": date_from.isoformat() if date_from else "",
+            "date_to": date_to.isoformat() if date_to else "",
+            "sync_available": _gmail_configured(),
+            "message_text": message_text,
+            "message_kind": message_kind,
+            "nav_active": "message_log",
+        },
+    )
+
+
+@app.post("/admin/message-log/sync-email", response_class=HTMLResponse)
+async def admin_message_log_sync_email(request: Request):
+    admin_user = get_authenticated_admin(request)
+    if not admin_user:
+        return _redirect_to_login()
+    if not _gmail_configured():
+        return RedirectResponse(url="/admin/message-log?msg=sync_failed", status_code=303)
+    inserted, _skipped = sync_gmail_inbound_messages(max_results=50)
+    msg_key = "sync_ok" if inserted >= 0 else "sync_failed"
+    return RedirectResponse(url=f"/admin/message-log?msg={msg_key}", status_code=303)
+
+
+@app.get("/admin/email_templates", response_class=HTMLResponse)
+def admin_email_templates_page(request: Request):
+    admin_user = get_authenticated_admin(request)
+    if not admin_user:
+        return _redirect_to_login()
+    templates_list = get_email_templates(active_only=False)
+    message = request.query_params.get("msg")
+    message_text = None
+    message_kind = "info"
+    if message == "created":
+        message_text = "Email template created."
+        message_kind = "success"
+    elif message == "updated":
+        message_text = "Email template updated."
+        message_kind = "success"
+    elif message == "error":
+        message_text = "Could not save email template."
+        message_kind = "error"
+    return templates.TemplateResponse(
+        "admin_email_templates.html",
+        {
+            "request": request,
+            "admin": admin_user,
+            "templates": templates_list,
+            "message_text": message_text,
+            "message_kind": message_kind,
+            "nav_active": "email_templates",
+        },
+    )
+
+
+@app.post("/admin/email_templates/create", response_class=HTMLResponse)
+async def admin_email_templates_create(
+    request: Request,
+    name: str = Form(...),
+    subject: str = Form(...),
+    body: str = Form(...),
+):
+    admin_user = get_authenticated_admin(request)
+    if not admin_user:
+        return _redirect_to_login()
+    ok, _msg = create_email_template(name, subject, body)
+    return RedirectResponse(url="/admin/email_templates?msg=" + ("created" if ok else "error"), status_code=303)
+
+
+@app.post("/admin/email_templates/{template_id}/update", response_class=HTMLResponse)
+async def admin_email_templates_update(
+    request: Request,
+    template_id: int,
+    name: str = Form(...),
+    subject: str = Form(...),
+    body: str = Form(...),
+):
+    admin_user = get_authenticated_admin(request)
+    if not admin_user:
+        return _redirect_to_login()
+    ok, _msg = update_email_template(template_id, name, subject, body)
+    return RedirectResponse(url="/admin/email_templates?msg=" + ("updated" if ok else "error"), status_code=303)
+
+
+@app.post("/admin/email_templates/{template_id}/toggle", response_class=HTMLResponse)
+async def admin_email_templates_toggle(
+    request: Request,
+    template_id: int,
+    active: str = Form("1"),
+):
+    admin_user = get_authenticated_admin(request)
+    if not admin_user:
+        return _redirect_to_login()
+    desired = str(active or "0").lower() in {"1", "true", "yes", "on"}
+    ok, _msg = toggle_email_template(template_id, desired)
+    return RedirectResponse(url="/admin/email_templates?msg=" + ("updated" if ok else "error"), status_code=303)
+
 
 @app.post("/admin/drivers/{wa_id}/whatsapp/send", response_class=HTMLResponse)
 async def admin_send_driver_whatsapp(
@@ -18673,19 +26348,12 @@ async def admin_save_ptp(
     admin_user = get_authenticated_admin(request)
     if not admin_user:
         return _redirect_to_login()
-    status = "failed"
-    if amount and payment:
-        try:
-            amt = float(amount)
-            pay = float(payment)
-            if pay >= amt and amt > 0:
-                status = "completed"
-            elif pay > 0:
-                status = "partial"
-            else:
-                status = "failed"
-        except Exception:
-            status = "failed"
+    status = _determine_ptp_status(
+        _coerce_float(amount),
+        _coerce_float(payment),
+        _parse_ptp_date(ptp_date),
+        jhb_now(),
+    )
     log_interaction(
         wa_id,
         channel="ptp",
@@ -19801,24 +27469,828 @@ def admin_interactions_page(request: Request, limit: int = 200):
     )
 
 
-@app.get("/admin/tickets", response_class=HTMLResponse)
-def admin_ticket_list(request: Request, status: Optional[str] = None, limit: int = 50):
+def _resolve_admin_ticket_filters(
+    request: Request,
+    *,
+    status: Optional[List[str]] = None,
+    issue_type: Optional[List[str]] = None,
+    assignee: Optional[List[str]] = None,
+    sla: Optional[List[str]] = None,
+    limit: int = 50,
+    max_limit: int = 200,
+) -> Dict[str, Any]:
+    """
+    Normalize the admin ticket list filters so both the UI and CSV export share
+    the same defaults and validations.
+    """
+    try:
+        limit_val = int(limit)
+    except (TypeError, ValueError):
+        limit_val = 50
+    limit_val = max(1, min(limit_val, max_limit))
+
+    raw_date_from = request.query_params.get("date_from")
+    raw_date_to = request.query_params.get("date_to")
+    date_from = _parse_date_param(raw_date_from)
+    date_to = _parse_date_param(raw_date_to)
+    if not date_from and not date_to:
+        today = jhb_now().date()
+        date_to = today
+        date_from = today - timedelta(days=6)
+    if date_from and date_to and date_from > date_to:
+        date_from, date_to = date_to, date_from
+
+    status_filter = [s.lower() for s in _parse_multi_param(status)]
+    issue_type_filter = [_normalize_issue_key(t) for t in _parse_multi_param(issue_type)]
+    issue_type_filter = [t for t in issue_type_filter if t]
+    assignee_filter = [a.lower() for a in _parse_multi_param(assignee)]
+    sla_filter = [s.lower() for s in _parse_multi_param(sla)]
+
+    return {
+        "limit": limit_val,
+        "date_from": date_from,
+        "date_to": date_to,
+        "status_filter": status_filter,
+        "issue_type_filter": issue_type_filter,
+        "assignee_filter": assignee_filter,
+        "sla_filter": sla_filter,
+    }
+
+
+def _build_admin_ticket_list_context(
+    request: Request,
+    admin_user: Dict[str, Any],
+    *,
+    status: Optional[List[str]] = None,
+    issue_type: Optional[List[str]] = None,
+    assignee: Optional[List[str]] = None,
+    sla: Optional[List[str]] = None,
+    limit: int = 50,
+    extra_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    filter_state = _resolve_admin_ticket_filters(
+        request,
+        status=status,
+        issue_type=issue_type,
+        assignee=assignee,
+        sla=sla,
+        limit=limit,
+    )
+    limit_val = filter_state["limit"]
+    date_from = filter_state["date_from"]
+    date_to = filter_state["date_to"]
+    status_filter = filter_state["status_filter"]
+    issue_type_filter = filter_state["issue_type_filter"]
+    assignee_filter = filter_state["assignee_filter"]
+    sla_filter = filter_state["sla_filter"]
+    tickets = fetch_driver_issue_tickets(
+        limit=limit_val,
+        status_filter=status_filter or None,
+        issue_types=issue_type_filter or None,
+        assignees=assignee_filter or None,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    status_options = get_ticket_status_options()
+    wa_template_options = get_whatsapp_templates()
+    email_template_options = get_email_templates(active_only=True)
+    admin_users = [user for user in fetch_admin_users() if user.get("is_active")]
+    for user in admin_users:
+        if "is_active" not in user:
+            user["is_active"] = True
+    if admin_user:
+        admin_fallback = dict(admin_user)
+        if "is_active" not in admin_fallback:
+            admin_fallback["is_active"] = True
+        if not admin_users:
+            admin_users = [admin_fallback]
+        elif not any(user.get("email") == admin_fallback.get("email") for user in admin_users):
+            admin_users.append(admin_fallback)
+    assignee_options = []
+    for user in admin_users:
+        email = (user.get("email") or "").strip()
+        if not email:
+            continue
+        assignee_options.append({"value": email, "label": email})
+
+    now = jhb_now()
+    pending_total = timedelta(0)
+    resolution_total = timedelta(0)
+    pending_count = 0
+    resolution_count = 0
+    for ticket in tickets:
+        status_value = (ticket.get("status") or "open").strip()
+        if not status_value:
+            status_value = "open"
+        ticket["status_value"] = status_value
+        ticket["status_css"] = status_value.replace("_", "-")
+        ticket["status_display"] = status_value.replace("_", " ").title()
+        ticket["issue_label"] = _issue_type_label(ticket.get("issue_type"))
+        ticket["created_display"] = _format_admin_ticket_datetime(ticket.get("created_at"))
+        updated_display = _format_admin_ticket_datetime(ticket.get("last_update_at"))
+        ticket["updated_display"] = updated_display or ticket["created_display"]
+        preview = (ticket.get("initial_message") or "").strip().replace("\n", " ")
+        if len(preview) > 120:
+            preview = f"{preview[:117]}..."
+        ticket["initial_preview"] = preview
+        sla_label, sla_css = _ticket_sla_state(ticket)
+        ticket["sla_label"] = sla_label
+        ticket["sla_css"] = sla_css
+        created_dt = _coerce_dt(ticket.get("created_at")) or _parse_log_timestamp(ticket.get("created_at"))
+        last_dt = _coerce_dt(ticket.get("last_update_at")) or _parse_log_timestamp(ticket.get("last_update_at"))
+        status_lower = status_value.lower()
+        if (
+            status_lower in RESOLVED_TICKET_STATUSES
+            and created_dt
+            and last_dt
+            and last_dt >= created_dt
+        ):
+            resolution_duration = last_dt - created_dt
+            resolution_total += resolution_duration
+            resolution_count += 1
+            ticket["resolution_time"] = _format_elapsed(resolution_duration)
+            ticket["pending_time"] = "—"
+        else:
+            ticket["resolution_time"] = "—"
+            if created_dt:
+                pending_duration = now - created_dt
+                pending_total += pending_duration
+                pending_count += 1
+                ticket["pending_time"] = _format_elapsed(pending_duration)
+            else:
+                ticket["pending_time"] = "—"
+
+    if sla_filter:
+        tickets = [ticket for ticket in tickets if ticket.get("sla_css") in sla_filter]
+
+    total_tickets = max(1, len(tickets))
+    issue_type_breakdown_limit = 7
+    issue_type_counter = Counter()
+    for ticket in tickets:
+        label = ticket.get("issue_label") or _issue_type_label(ticket.get("issue_type"))
+        if label:
+            issue_type_counter[label] += 1
+    issue_type_total = len(issue_type_counter)
+    issue_type_breakdown = [
+        {
+            "label": label,
+            "count": count,
+            "pct": round((count / total_tickets) * 100, 1),
+        }
+        for label, count in sorted(
+            issue_type_counter.items(),
+            key=lambda item: (-item[1], item[0])
+        )[:issue_type_breakdown_limit]
+    ]
+
+    status_counts: List[Tuple[str, int]] = []
+    for status in status_options:
+        count = sum(1 for ticket in tickets if ticket.get("status") == status)
+        if count:
+            status_counts.append((status, count))
+    status_breakdown = [
+        {
+            "label": status.replace("_", " ").title(),
+            "count": count,
+            "pct": round((count / total_tickets) * 100, 1),
+        }
+        for status, count in status_counts
+    ]
+
+    sla_breakdown_cards = []
+    for key, label in SLA_BREAKDOWN_LABELS:
+        count = sum(1 for ticket in tickets if ticket.get("sla_css") == key)
+        sla_breakdown_cards.append(
+            {
+                "label": label,
+                "count": count,
+                "pct": round((count / total_tickets) * 100, 1),
+            }
+        )
+
+    wa_ids = [ticket.get("wa_id") for ticket in tickets if ticket.get("wa_id")]
+    unique_wa_ids = list(dict.fromkeys(wa_ids))
+    last_message_map = _fetch_latest_inbound_timestamps(unique_wa_ids)
+    reg_map = _fetch_driver_registration_by_wa(unique_wa_ids)
+    driver_display_names: Dict[str, str] = {}
+    for ticket in tickets:
+        wa_id = ticket.get("wa_id")
+        metadata = ticket.get("metadata_dict") or {}
+        display_name = metadata.get("driver_display_name")
+        if wa_id and display_name:
+            driver_display_names[wa_id] = str(display_name).strip()
+        ticket["ticket_model"] = (
+            metadata.get("asset_model")
+            or metadata.get("model")
+            or metadata.get("vehicle_model")
+            or ""
+        )
+        normalized_wa = _normalize_wa_id(wa_id or "") or (wa_id or "")
+        ticket["ticket_registration"] = (
+            metadata.get("car_reg_number")
+            or metadata.get("registration_number")
+            or metadata.get("reg_number")
+            or metadata.get("vehicle_reg")
+            or metadata.get("vehicle")
+            or reg_map.get(normalized_wa, "")
+        )
+    for ticket in tickets:
+        wa_id = ticket.get("wa_id")
+        ticket["driver_name"] = (
+            driver_display_names.get(wa_id)
+            or wa_id
+            or "Driver"
+        )
+        last_ts = last_message_map.get(wa_id)
+        ticket["driver_last_message_display"] = (
+            _format_admin_ticket_datetime(last_ts) if last_ts else None
+        )
+        ticket["driver_last_message_ts"] = (
+            last_ts.isoformat() if last_ts else ""
+        )
+
+    message_key = request.query_params.get("msg")
+    message_text: Optional[str] = None
+    message_kind = "info"
+    if message_key == "created":
+        message_text = "Ticket created and queued for ops."
+        message_kind = "success"
+    elif message_key == "create_failed":
+        message_text = "Something went wrong while creating the ticket."
+        message_kind = "error"
+    elif message_key == "missing_required":
+        message_text = "Driver WhatsApp number and issue type are required."
+        message_kind = "error"
+    elif message_key == "assigned":
+        assignee = (request.query_params.get("assignee") or "").strip()
+        try:
+            assigned_count = int(request.query_params.get("assigned", "0") or 0)
+        except ValueError:
+            assigned_count = 0
+        try:
+            skipped_count = int(request.query_params.get("skipped", "0") or 0)
+        except ValueError:
+            skipped_count = 0
+        if assigned_count:
+            message_text = f"Updated {assigned_count} ticket(s) to {assignee or 'selected admin'}."
+            if skipped_count:
+                message_text = f"{message_text} {skipped_count} already assigned to that admin."
+            message_kind = "success"
+        else:
+            message_text = "No tickets were updated."
+            message_kind = "info"
+    elif message_key == "assign_none":
+        message_text = "Select at least one ticket to assign."
+        message_kind = "error"
+    elif message_key == "assign_invalid":
+        message_text = "Select a valid admin to assign tickets."
+        message_kind = "error"
+    elif message_key == "unassigned":
+        try:
+            unassigned_count = int(request.query_params.get("unassigned", "0") or 0)
+        except ValueError:
+            unassigned_count = 0
+        try:
+            skipped_count = int(request.query_params.get("skipped", "0") or 0)
+        except ValueError:
+            skipped_count = 0
+        if unassigned_count:
+            message_text = f"Unassigned {unassigned_count} ticket(s)."
+            if skipped_count:
+                message_text = f"{message_text} {skipped_count} already unassigned."
+            message_kind = "success"
+        else:
+            message_text = "No assigned tickets were updated."
+            message_kind = "info"
+    elif message_key == "unassign_none":
+        message_text = "Select at least one assigned ticket to unassign."
+        message_kind = "error"
+    elif message_key == "import_done":
+        created_count = int(request.query_params.get("created", "0") or 0)
+        skipped_count = int(request.query_params.get("skipped", "0") or 0)
+        failed_count = int(request.query_params.get("failed", "0") or 0)
+        wa_sent = int(request.query_params.get("wa_sent", "0") or 0)
+        email_sent = int(request.query_params.get("email_sent", "0") or 0)
+        message_text = (
+            f"Imported {created_count} ticket(s). Skipped {skipped_count}, failed {failed_count}. "
+            f"WA sent: {wa_sent}, email sent: {email_sent}."
+        )
+        message_kind = "success" if created_count else "info"
+    elif message_key == "import_error":
+        message_text = "Bulk import failed. Please check your CSV and mapping."
+        message_kind = "error"
+    elif message_key == "import_mapping_missing":
+        message_text = "Select required CSV columns for WhatsApp ID and issue type."
+        message_kind = "error"
+    elif message_key == "import_preview_expired":
+        message_text = "Import preview expired. Please upload the CSV again."
+        message_kind = "error"
+
+    issue_type_options_all = get_ticket_issue_type_options(active_only=False)
+    issue_type_options_active = [opt for opt in issue_type_options_all if opt.get("active")]
+    default_issue_type_value = (
+        issue_type_options_active[0]["value"] if issue_type_options_active else ""
+    )
+
+    payload = {
+        "request": request,
+        "admin": admin_user,
+        "tickets": tickets,
+        "status_filter": status_filter,
+        "issue_type_filter": issue_type_filter,
+        "assignee_filter": assignee_filter,
+        "status_options": status_options,
+        "wa_template_options": wa_template_options,
+        "email_template_options": email_template_options,
+        "issue_type_options": issue_type_options_all,
+        "issue_type_options_active": issue_type_options_active,
+        "default_issue_type_value": default_issue_type_value,
+        "assignee_options": assignee_options,
+        "admin_users": admin_users,
+        "limit_val": limit_val,
+        "date_from": date_from.isoformat() if date_from else "",
+        "date_to": date_to.isoformat() if date_to else "",
+        "sla_filter": sla_filter,
+        "message_text": message_text,
+        "message_kind": message_kind,
+        "nav_active": "tickets",
+        "sla_breakdown": {
+            "within": sum(1 for ticket in tickets if ticket.get("sla_css") == "within"),
+            "overdue": sum(1 for ticket in tickets if ticket.get("sla_css") == "overdue"),
+        },
+        "sla_breakdown_cards": sla_breakdown_cards,
+        "total_tickets": total_tickets,
+        "status_breakdown": status_breakdown,
+        "sla_breakdown_labels": SLA_BREAKDOWN_LABELS,
+        "avg_pending_time": (
+            _format_elapsed(pending_total / pending_count) if pending_count else "—"
+        ),
+        "avg_resolution_time": (
+            _format_elapsed(resolution_total / resolution_count) if resolution_count else "—"
+        ),
+        "issue_type_breakdown": issue_type_breakdown,
+        "issue_type_total": issue_type_total,
+        "issue_type_breakdown_limit": issue_type_breakdown_limit,
+    }
+    if extra_context:
+        payload.update(extra_context)
+    return payload
+
+
+@app.get("/admin/tickets/export.csv")
+def admin_ticket_list_csv_export(
+    request: Request,
+    status: Optional[List[str]] = Query(None),
+    issue_type: Optional[List[str]] = Query(None),
+    assignee: Optional[List[str]] = Query(None),
+    sla: Optional[List[str]] = Query(None),
+    limit: int = 200,
+):
     admin_user = get_authenticated_admin(request)
     if not admin_user:
         return _redirect_to_login()
-    tickets = fetch_driver_issue_tickets(limit=limit, status_filter=status)
-    status_options = get_ticket_status_options()
+
+    filter_state = _resolve_admin_ticket_filters(
+        request,
+        status=status,
+        issue_type=issue_type,
+        assignee=assignee,
+        sla=sla,
+        limit=limit,
+        max_limit=1000,
+    )
+
+    tickets = fetch_driver_issue_tickets(
+        limit=filter_state["limit"],
+        status_filter=filter_state["status_filter"] or None,
+        issue_types=filter_state["issue_type_filter"] or None,
+        assignees=filter_state["assignee_filter"] or None,
+        date_from=filter_state["date_from"],
+        date_to=filter_state["date_to"],
+    )
+
+    now = jhb_now()
+    for ticket in tickets:
+        status_value = (ticket.get("status") or "open").strip()
+        if not status_value:
+            status_value = "open"
+        ticket["status_value"] = status_value
+        ticket["status_css"] = status_value.replace("_", "-")
+        ticket["status_display"] = status_value.replace("_", " ").title()
+        ticket["issue_label"] = _issue_type_label(ticket.get("issue_type"))
+        ticket["created_display"] = _format_admin_ticket_datetime(ticket.get("created_at"))
+        updated_display = _format_admin_ticket_datetime(ticket.get("last_update_at"))
+        ticket["updated_display"] = updated_display or ticket["created_display"]
+        sla_label, sla_css = _ticket_sla_state(ticket)
+        ticket["sla_label"] = sla_label
+        ticket["sla_css"] = sla_css
+        status_lower = status_value.lower()
+        created_dt = _coerce_dt(ticket.get("created_at")) or _parse_log_timestamp(ticket.get("created_at"))
+        last_dt = _coerce_dt(ticket.get("last_update_at")) or _parse_log_timestamp(ticket.get("last_update_at"))
+        if (
+            status_lower in RESOLVED_TICKET_STATUSES
+            and created_dt
+            and last_dt
+            and last_dt >= created_dt
+        ):
+            resolution_duration = last_dt - created_dt
+            ticket["resolution_time"] = _format_elapsed(resolution_duration)
+            ticket["pending_time"] = "—"
+        else:
+            ticket["resolution_time"] = "—"
+            if created_dt:
+                pending_duration = now - created_dt
+                ticket["pending_time"] = _format_elapsed(pending_duration)
+            else:
+                ticket["pending_time"] = "—"
+
+    sla_filter = [s.lower() for s in filter_state["sla_filter"]]
+    if sla_filter:
+        tickets = [ticket for ticket in tickets if ticket.get("sla_css") in sla_filter]
+
+    wa_ids = [ticket.get("wa_id") for ticket in tickets if ticket.get("wa_id")]
+    unique_wa_ids = list(dict.fromkeys(wa_ids))
+    last_message_map = _fetch_latest_inbound_timestamps(unique_wa_ids)
+    reg_map = _fetch_driver_registration_by_wa(unique_wa_ids)
+    driver_display_names: Dict[str, str] = {}
+    for ticket in tickets:
+        wa_id = ticket.get("wa_id")
+        metadata = ticket.get("metadata_dict") or {}
+        display_name = metadata.get("driver_display_name")
+        if wa_id and display_name:
+            driver_display_names[wa_id] = str(display_name).strip()
+        ticket["ticket_model"] = (
+            metadata.get("asset_model")
+            or metadata.get("model")
+            or metadata.get("vehicle_model")
+            or ""
+        )
+        normalized_wa = _normalize_wa_id(wa_id or "") or (wa_id or "")
+        ticket["ticket_registration"] = (
+            metadata.get("car_reg_number")
+            or metadata.get("registration_number")
+            or metadata.get("reg_number")
+            or metadata.get("vehicle_reg")
+            or metadata.get("vehicle")
+            or reg_map.get(normalized_wa, "")
+        )
+    for ticket in tickets:
+        wa_id = ticket.get("wa_id")
+        ticket["driver_name"] = (
+            driver_display_names.get(wa_id)
+            or wa_id
+            or "Driver"
+        )
+        last_ts = last_message_map.get(wa_id)
+        ticket["driver_last_message_display"] = (
+            _format_admin_ticket_datetime(last_ts) if last_ts else None
+        )
+
+    def _format_csv_value(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, (list, tuple)):
+            return "; ".join(str(v) for v in value if v not in (None, ""))
+        return str(value)
+
+    columns = [
+        ("Ticket ID", lambda t: f"#{t.get('id')}" if t.get("id") else ""),
+        ("Created At", lambda t: t.get("created_display") or ""),
+        ("Last Updated", lambda t: t.get("updated_display") or ""),
+        ("Driver WA ID", lambda t: t.get("wa_id") or ""),
+        ("Driver name", lambda t: t.get("driver_name") or ""),
+        ("Assignee", lambda t: t.get("assigned_admin_email") or ""),
+        ("Issue Type", lambda t: t.get("issue_label") or ""),
+        ("Status", lambda t: t.get("status_display") or ""),
+        ("SLA", lambda t: t.get("sla_label") or ""),
+        ("Pending time", lambda t: t.get("pending_time") or ""),
+        ("Resolution time", lambda t: t.get("resolution_time") or ""),
+        ("Model", lambda t: t.get("ticket_model") or ""),
+        ("Registration", lambda t: t.get("ticket_registration") or ""),
+        ("Location", lambda t: t.get("location_desc") or ""),
+        ("Initial message", lambda t: (t.get("initial_message") or "").replace("\n", " ").strip()),
+        ("Media count", lambda t: len(t.get("media_list") or [])),
+    ]
+
+    output = io.StringIO()
+    writer = csv.writer(output, lineterminator="\n")
+    writer.writerow([header for header, _ in columns])
+    for ticket in tickets:
+        row: List[str] = []
+        for _, accessor in columns:
+            try:
+                value = accessor(ticket)
+            except Exception:
+                value = ""
+            row.append(_format_csv_value(value))
+        writer.writerow(row)
+
+    csv_bytes = output.getvalue().encode("utf-8")
+    stamp = now.strftime("%Y%m%d_%H%M%S")
+    filename = f"tickets_export_{stamp}.csv"
+    return StreamingResponse(
+        io.BytesIO(csv_bytes),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/admin/tickets", response_class=HTMLResponse)
+def admin_ticket_list(
+    request: Request,
+    status: Optional[List[str]] = Query(None),
+    issue_type: Optional[List[str]] = Query(None),
+    assignee: Optional[List[str]] = Query(None),
+    sla: Optional[List[str]] = Query(None),
+    limit: int = 50,
+):
+    admin_user = get_authenticated_admin(request)
+    if not admin_user:
+        return _redirect_to_login()
     return templates.TemplateResponse(
         "admin_tickets.html",
+        _build_admin_ticket_list_context(
+            request,
+            admin_user,
+            status=status,
+            issue_type=issue_type,
+            assignee=assignee,
+            sla=sla,
+            limit=limit,
+        ),
+    )
+
+
+@app.post("/admin/tickets/create")
+async def admin_ticket_create(
+    request: Request,
+    wa_id: str = Form(...),
+    issue_type: str = Form(...),
+    initial_message: Optional[str] = Form(None),
+    status: Optional[str] = Form(None),
+    location_desc: Optional[str] = Form(None),
+    wa_template_id: Optional[str] = Form(None),
+    email_template_id: Optional[str] = Form(None),
+):
+    admin_user = get_authenticated_admin(request)
+    if not admin_user:
+        return _redirect_to_login()
+    wa_id_raw = (wa_id or "").strip()
+    issue_type_raw = (issue_type or "").strip()
+    if not wa_id_raw or not issue_type_raw:
+        return RedirectResponse(url="/admin/tickets?msg=missing_required", status_code=303)
+    initial_message_clean = (initial_message or "").strip()
+    if not initial_message_clean:
+        initial_message_clean = f"Ticket created via admin UI by {admin_user.get('email') or 'admin'}"
+    status_value = (status or "collecting").strip().lower() or "collecting"
+    location_value = (location_desc or "").strip() or None
+    template_value = (wa_template_id or "").strip()
+    email_template_value = (email_template_id or "").strip()
+    result = _admin_create_ticket_with_templates(
+        admin_user=admin_user,
+        wa_id=wa_id_raw,
+        issue_type=issue_type_raw,
+        initial_message=initial_message_clean,
+        status=status_value,
+        location_desc=location_value,
+        wa_template_id=template_value,
+        email_template_id=email_template_value,
+        send_wa=bool(template_value),
+        send_email=bool(email_template_value),
+    )
+    msg_key = "created" if result.get("ticket_id") else "create_failed"
+    return RedirectResponse(url=f"/admin/tickets?msg={msg_key}", status_code=303)
+
+
+@app.post("/admin/tickets/import/preview", response_class=HTMLResponse)
+async def admin_ticket_import_preview(
+    request: Request,
+    csv_file: UploadFile = File(...),
+):
+    admin_user = get_authenticated_admin(request)
+    if not admin_user:
+        return _redirect_to_login()
+    _prune_ticket_import_preview_cache()
+    rows, headers, error = _parse_ticket_import_csv(csv_file)
+    if error:
+        return templates.TemplateResponse(
+            "admin_tickets.html",
+            _build_admin_ticket_list_context(
+                request,
+                admin_user,
+                extra_context={"message_text": error, "message_kind": "error"},
+            ),
+            status_code=400,
+        )
+    suggested = _guess_ticket_import_mapping(headers)
+    preview_id = secrets.token_urlsafe(12)
+    _set_ticket_import_preview_cache(
+        preview_id,
         {
-            "request": request,
-            "admin": admin_user,
-            "tickets": tickets,
-            "status_filter": status or "",
-            "status_options": status_options,
-            "nav_active": "tickets",
+            "rows": rows,
+            "headers": headers,
+            "source_filename": csv_file.filename or "upload.csv",
+            "admin_email": admin_user.get("email"),
         },
     )
+    sample_headers = headers[:6]
+    sample_rows = []
+    for row in rows[:20]:
+        sample_rows.append({"row_number": row.get("row_number"), "row_values": row})
+    return templates.TemplateResponse(
+        "admin_tickets.html",
+        _build_admin_ticket_list_context(
+            request,
+            admin_user,
+            extra_context={
+                "ticket_import_preview": {
+                    "preview_id": preview_id,
+                    "source_filename": csv_file.filename or "upload.csv",
+                    "total_rows": len(rows),
+                    "sample_headers": sample_headers,
+                    "sample_rows": sample_rows,
+                },
+                "ticket_import_headers": headers,
+                "ticket_import_suggested": suggested,
+            },
+        ),
+    )
+
+
+@app.post("/admin/tickets/import/process")
+async def admin_ticket_import_process(request: Request):
+    admin_user = get_authenticated_admin(request)
+    if not admin_user:
+        return _redirect_to_login()
+    form = await request.form()
+    preview_id = str(form.get("preview_id") or "").strip()
+    preview = _get_ticket_import_preview_cache(preview_id)
+    if not preview:
+        return RedirectResponse(url="/admin/tickets?msg=import_preview_expired", status_code=303)
+
+    header_values = {h.get("value") for h in (preview.get("headers") or []) if h.get("value")}
+    col_wa = str(form.get("col_wa_id") or "").strip()
+    col_issue = str(form.get("col_issue_type") or "").strip()
+    col_status = str(form.get("col_status") or "").strip()
+    col_message = str(form.get("col_initial_message") or "").strip()
+    col_location = str(form.get("col_location_desc") or "").strip()
+    col_send_wa = str(form.get("col_send_wa") or "").strip()
+    col_send_email = str(form.get("col_send_email") or "").strip()
+
+    default_issue_type = str(form.get("default_issue_type") or "").strip()
+    default_status = str(form.get("default_status") or "").strip() or "collecting"
+
+    wa_template_id = str(form.get("wa_template_id") or "").strip()
+    email_template_id = str(form.get("email_template_id") or "").strip()
+    wa_send_mode = str(form.get("wa_send_mode") or "column").strip()
+    email_send_mode = str(form.get("email_send_mode") or "column").strip()
+
+    if (
+        not col_wa
+        or (col_wa not in header_values)
+        or (col_issue and col_issue not in header_values)
+        or (col_status and col_status not in header_values)
+        or (col_message and col_message not in header_values)
+        or (col_location and col_location not in header_values)
+        or (col_send_wa and col_send_wa not in header_values)
+        or (col_send_email and col_send_email not in header_values)
+        or (not col_issue and not default_issue_type)
+    ):
+        return RedirectResponse(url="/admin/tickets?msg=import_mapping_missing", status_code=303)
+
+    rows = preview.get("rows") or []
+    created = 0
+    skipped = 0
+    failed = 0
+    wa_sent = 0
+    email_sent = 0
+
+    for row in rows:
+        wa_raw = _ticket_import_value(row, col_wa)
+        if not wa_raw:
+            skipped += 1
+            continue
+        issue_raw = _ticket_import_value(row, col_issue) or default_issue_type
+        issue_value = _normalize_issue_key(issue_raw)
+        if not issue_value:
+            skipped += 1
+            continue
+        status_raw = _ticket_import_value(row, col_status) or default_status
+        status_value = _normalize_status_value(status_raw) or "collecting"
+        initial_message = _ticket_import_value(row, col_message)
+        if not initial_message:
+            initial_message = (
+                f"Ticket imported by {admin_user.get('email') or 'admin'} "
+                f"from {preview.get('source_filename') or 'upload.csv'}."
+            )
+        location_desc = _ticket_import_value(row, col_location) or None
+
+        send_wa = False
+        if wa_send_mode == "all":
+            send_wa = bool(wa_template_id)
+        elif wa_send_mode == "column":
+            send_wa = bool(_parse_yes_no_flag(_ticket_import_value(row, col_send_wa)))
+        else:
+            send_wa = False
+
+        send_email = False
+        if email_send_mode == "all":
+            send_email = bool(email_template_id)
+        elif email_send_mode == "column":
+            send_email = bool(_parse_yes_no_flag(_ticket_import_value(row, col_send_email)))
+        else:
+            send_email = False
+
+        result = _admin_create_ticket_with_templates(
+            admin_user=admin_user,
+            wa_id=wa_raw,
+            issue_type=issue_value,
+            initial_message=initial_message,
+            status=status_value,
+            location_desc=location_desc,
+            wa_template_id=wa_template_id if send_wa else None,
+            email_template_id=email_template_id if send_email else None,
+            send_wa=send_wa,
+            send_email=send_email,
+        )
+        if not result.get("ticket_id"):
+            failed += 1
+            continue
+        created += 1
+        if result.get("wa_sent"):
+            wa_sent += 1
+        if result.get("email_sent"):
+            email_sent += 1
+
+    _TICKET_IMPORT_PREVIEW_CACHE.pop(preview_id, None)
+    query = urlencode(
+        {
+            "msg": "import_done",
+            "created": created,
+            "skipped": skipped,
+            "failed": failed,
+            "wa_sent": wa_sent,
+            "email_sent": email_sent,
+        }
+    )
+    return RedirectResponse(url=f"/admin/tickets?{query}", status_code=303)
+
+
+@app.post("/admin/tickets/assign")
+async def admin_ticket_assign_bulk(
+    request: Request,
+    assignee_email: str = Form(...),
+    ticket_ids: Optional[List[int]] = Form(None),
+):
+    admin_user = get_authenticated_admin(request)
+    if not admin_user:
+        return _redirect_to_login()
+    clean_ids = [int(t) for t in (ticket_ids or []) if str(t).isdigit()]
+    if not clean_ids:
+        return RedirectResponse(url="/admin/tickets?msg=assign_none", status_code=303)
+    clean_email = _normalize_email(assignee_email) or (assignee_email or "").strip()
+    if not clean_email:
+        return RedirectResponse(url="/admin/tickets?msg=assign_invalid", status_code=303)
+    updated, skipped = assign_driver_issue_tickets(
+        clean_ids,
+        clean_email,
+        admin_email=admin_user.get("email"),
+        allow_reassign=True,
+    )
+    query = urlencode(
+        {
+            "msg": "assigned",
+            "assigned": str(updated),
+            "skipped": str(skipped),
+            "assignee": clean_email,
+        }
+    )
+    return RedirectResponse(url=f"/admin/tickets?{query}", status_code=303)
+
+
+@app.post("/admin/tickets/unassign")
+async def admin_ticket_unassign_bulk(
+    request: Request,
+    ticket_ids: Optional[List[int]] = Form(None),
+):
+    admin_user = get_authenticated_admin(request)
+    if not admin_user:
+        return _redirect_to_login()
+    clean_ids = [int(t) for t in (ticket_ids or []) if str(t).isdigit()]
+    if not clean_ids:
+        return RedirectResponse(url="/admin/tickets?msg=unassign_none", status_code=303)
+    updated, skipped = unassign_driver_issue_tickets(
+        clean_ids,
+        admin_email=admin_user.get("email"),
+    )
+    query = urlencode(
+        {
+            "msg": "unassigned",
+            "unassigned": str(updated),
+            "skipped": str(skipped),
+        }
+    )
+    return RedirectResponse(url=f"/admin/tickets?{query}", status_code=303)
 
 
 @app.get("/admin/tickets/{ticket_id}", response_class=HTMLResponse)
@@ -19829,10 +28301,18 @@ def admin_ticket_detail(request: Request, ticket_id: int):
     ticket = fetch_driver_issue_ticket(ticket_id)
     if not ticket:
         return PlainTextResponse("Ticket not found", status_code=404)
-    status_options = get_ticket_status_options()
+    status_options = _filter_status_options_for_issue(
+        ticket.get("issue_type"),
+        get_ticket_status_options(),
+        current_status=ticket.get("status"),
+    )
     message = request.query_params.get("msg")
     logs = fetch_driver_issue_logs(ticket_id, limit=100)
+    status_timeline = _build_ticket_status_timeline(ticket, logs)
     conversation = fetch_ticket_conversation(ticket.get("wa_id"), limit=40)
+    email_logs = fetch_email_logs(ticket_id=ticket_id, limit=100)
+    reply_email_default = _default_ticket_reply_email(ticket, email_logs)
+    reply_subject_default = _default_ticket_reply_subject(ticket)
     return templates.TemplateResponse(
         "admin_ticket_detail.html",
         {
@@ -19842,7 +28322,11 @@ def admin_ticket_detail(request: Request, ticket_id: int):
             "status_options": status_options,
             "message": message,
             "logs": logs,
+            "status_timeline": status_timeline,
             "conversation": conversation,
+            "email_logs": email_logs,
+            "reply_email_default": reply_email_default,
+            "reply_subject_default": reply_subject_default,
             "nav_active": "tickets",
         },
     )
@@ -19895,6 +28379,11 @@ async def admin_ticket_update_status(
     prev_status = ticket.get("status") if ticket else None
     new_status_clean = (new_status or "").strip()
     note_clean = (note or "").strip()
+    if new_status_clean and _status_requires_admin_note(new_status_clean) and not note_clean:
+        return RedirectResponse(
+            url=f"/admin/tickets/{ticket_id}?msg=note_required",
+            status_code=303,
+        )
     status_updated = False
     note_updated = False
     if new_status_clean:
@@ -19964,6 +28453,9 @@ async def admin_ticket_reply(
     request: Request,
     ticket_id: int,
     reply_text: str = Form(...),
+    reply_channel: str = Form("whatsapp"),
+    reply_subject: Optional[str] = Form(None),
+    reply_to: Optional[str] = Form(None),
 ):
     admin_user = get_authenticated_admin(request)
     if not admin_user:
@@ -19977,50 +28469,95 @@ async def admin_ticket_reply(
     ticket = fetch_driver_issue_ticket(ticket_id)
     if not ticket:
         return PlainTextResponse("Ticket not found", status_code=404)
-    wa_id = ticket.get("wa_id")
-    if not wa_id:
-        return RedirectResponse(
-            url=f"/admin/tickets/{ticket_id}?msg=reply_missing_wa",
-            status_code=303,
+    channel = (reply_channel or "whatsapp").strip().lower()
+    if channel == "email":
+        email_logs = fetch_email_logs(ticket_id=ticket_id, limit=50)
+        default_recipient = _default_ticket_reply_email(ticket, email_logs)
+        recipient = (reply_to or default_recipient or "").strip()
+        if not recipient:
+            return RedirectResponse(
+                url=f"/admin/tickets/{ticket_id}?msg=reply_missing_email",
+                status_code=303,
+            )
+        subject = (reply_subject or "").strip() or _default_ticket_reply_subject(ticket)
+        sent_ok, message_id, thread_id = send_email_message(recipient, subject, reply_text)
+        status_label = "sent" if sent_ok else "send_failed"
+        log_email_event(
+            direction="OUTBOUND",
+            email_address=recipient,
+            subject=subject,
+            body=reply_text,
+            status=status_label,
+            wa_id=ticket.get("wa_id"),
+            ticket_id=ticket_id,
+            admin_email=admin_user.get("email"),
+            message_id=message_id,
+            thread_id=thread_id,
+            raw_json={"ticket_id": ticket_id, "admin_reply": True},
         )
-    outbound_id = send_whatsapp_text(wa_id, reply_text)
-    send_status = "sent" if outbound_id else "send_failed"
-    timestamp_unix = str(int(time.time()))
-    s_label, s_score, s_raw = analyze_sentiment(reply_text)
-    log_message(
-        direction="OUTBOUND",
-        wa_id=wa_id,
-        text=reply_text,
-        intent=None,
-        status=send_status,
-        wa_message_id=outbound_id,
-        message_id=outbound_id,
-        business_number=None,
-        phone_number_id=None,
-        origin_type="admin_console",
-        raw_json={"ticket_id": ticket_id, "admin_reply": True},
-        timestamp_unix=timestamp_unix,
-        sentiment=s_label,
-        sentiment_score=s_score,
-        intent_label=None,
-        ai_raw=s_raw,
-        conversation_id=f"admin-reply-{ticket_id}-{timestamp_unix}",
-    )
-    update_driver_issue_metadata(
-        ticket_id,
-        {
-            "admin_last_reply": reply_text,
-            "admin_last_reply_at": jhb_now().strftime("%Y-%m-%d %H:%M:%S"),
-            "admin_last_reply_by": admin_user.get("email"),
-        },
-    )
-    log_driver_issue_ticket_event(
-        ticket_id,
-        admin_email=admin_user.get("email"),
-        action_type="reply",
-        note=reply_text,
-    )
-    msg = "reply_sent" if outbound_id else "reply_failed"
+        update_driver_issue_metadata(
+            ticket_id,
+            {
+                "admin_last_reply": reply_text,
+                "admin_last_reply_at": jhb_now().strftime("%Y-%m-%d %H:%M:%S"),
+                "admin_last_reply_by": admin_user.get("email"),
+                "admin_last_email_reply": True,
+                "admin_last_email_to": recipient,
+                "admin_last_email_subject": subject,
+            },
+        )
+        log_driver_issue_ticket_event(
+            ticket_id,
+            admin_email=admin_user.get("email"),
+            action_type="email_reply" if sent_ok else "email_reply_failed",
+            note=f"To {recipient} | {subject}",
+        )
+        msg = "reply_email_sent" if sent_ok else "reply_email_failed"
+    else:
+        wa_id = ticket.get("wa_id")
+        if not wa_id:
+            return RedirectResponse(
+                url=f"/admin/tickets/{ticket_id}?msg=reply_missing_wa",
+                status_code=303,
+            )
+        outbound_id = send_whatsapp_text(wa_id, reply_text)
+        send_status = "sent" if outbound_id else "send_failed"
+        timestamp_unix = str(int(time.time()))
+        s_label, s_score, s_raw = analyze_sentiment(reply_text)
+        log_message(
+            direction="OUTBOUND",
+            wa_id=wa_id,
+            text=reply_text,
+            intent=None,
+            status=send_status,
+            wa_message_id=outbound_id,
+            message_id=outbound_id,
+            business_number=None,
+            phone_number_id=None,
+            origin_type="admin_console",
+            raw_json={"ticket_id": ticket_id, "admin_reply": True},
+            timestamp_unix=timestamp_unix,
+            sentiment=s_label,
+            sentiment_score=s_score,
+            intent_label=None,
+            ai_raw=s_raw,
+            conversation_id=f"admin-reply-{ticket_id}-{timestamp_unix}",
+        )
+        update_driver_issue_metadata(
+            ticket_id,
+            {
+                "admin_last_reply": reply_text,
+                "admin_last_reply_at": jhb_now().strftime("%Y-%m-%d %H:%M:%S"),
+                "admin_last_reply_by": admin_user.get("email"),
+            },
+        )
+        log_driver_issue_ticket_event(
+            ticket_id,
+            admin_email=admin_user.get("email"),
+            action_type="reply",
+            note=reply_text,
+        )
+        msg = "reply_sent" if outbound_id else "reply_failed"
     return RedirectResponse(
         url=f"/admin/tickets/{ticket_id}?msg={msg}",
         status_code=303,
@@ -20036,8 +28573,296 @@ async def verify(request: Request):
         return PlainTextResponse(challenge)
     raise HTTPException(status_code=403, detail="Verification failed")
 
+def _process_webhook_entry(entry: Dict[str, Any]) -> None:
+    try:
+        meta = entry.get("metadata", {})
+        business_number = meta.get("display_phone_number")
+        phone_number_id = meta.get("phone_number_id")
+        origin_type = entry.get("messaging_product", "whatsapp")
+
+        # status events
+        for st in entry.get("statuses", []) or []:
+            log_status_event(
+                status_event=st,
+                business_number=business_number,
+                phone_number_id=phone_number_id,
+                origin_type=origin_type,
+            )
+
+        messages = entry.get("messages") or []
+        if not messages:
+            return
+
+        m = messages[0]
+        msg_id = m.get("id")
+        timestamp_unix = m.get("timestamp")
+
+        wa_id = m.get("from")
+        message_type = m.get("type") or "text"
+        text: str = ""
+        media_url: Optional[str] = None
+        media_id: Optional[str] = None
+        caption_text: str = ""
+        location_payload: Optional[Dict[str, Any]] = None
+
+        transcript: Optional[str] = None
+        transcription_error: Optional[str] = None
+
+        if message_type == "text":
+            text = (m.get("text") or {}).get("body", "").strip()
+        else:
+            media_obj = m.get(message_type) or {}
+            caption_text = (media_obj.get("caption") or media_obj.get("filename") or "").strip()
+            text = caption_text or ""
+            media_id = media_obj.get("id")
+            media_url = media_obj.get("link") or fetch_media_url(media_id)
+            if message_type == "location":
+                location_payload = {
+                    "latitude": media_obj.get("latitude"),
+                    "longitude": media_obj.get("longitude"),
+                    "name": media_obj.get("name"),
+                    "address": media_obj.get("address"),
+                }
+                if not text:
+                    text = media_obj.get("name") or media_obj.get("address") or "[location]"
+            if message_type in AUDIO_MESSAGE_TYPES:
+                media_bytes = download_media_bytes(media_url)
+                if media_bytes:
+                    transcript, transcribe_err = transcribe_audio_bytes(media_bytes, mime_type=media_obj.get("mime_type"))
+                    if transcript:
+                        text = transcript.strip()
+                    else:
+                        transcription_error = transcribe_err or "transcription_failed"
+                else:
+                    transcription_error = "download_failed"
+                if not text:
+                    placeholder = "voice note" if message_type == "voice" else "audio message"
+                    text = f"[{placeholder}]"
+            else:
+                if not text:
+                    text = f"[{message_type} message]"
+
+        ctx_f = load_context_file(wa_id)
+        ctx = dict(ctx_f)
+        if _maybe_auto_reactivate(ctx, text):
+            log.info("Auto-reactivated %s after receiving %r", wa_id, text)
+        if _dedupe_inbound_message(ctx, msg_id):
+            save_context_file(wa_id, ctx)
+            return
+        _clear_closed_ticket_context(ctx)
+        driver = lookup_driver_by_wa(wa_id)
+
+        if media_url:
+            ctx["_last_media"] = {
+                "id": media_id,
+                "type": message_type,
+                "url": media_url,
+                "caption": caption_text,
+                "timestamp": timestamp_unix,
+            }
+
+        if message_type in AUDIO_MESSAGE_TYPES:
+            if transcript:
+                ctx["_audio_transcript_status"] = "ok"
+                ctx["_last_audio_transcript"] = {
+                    "text": transcript,
+                    "captured_at": time.time(),
+                    "media_id": media_id,
+                }
+                ctx.pop("_last_transcript_error", None)
+            else:
+                ctx["_audio_transcript_status"] = "failed"
+                if transcription_error:
+                    ctx["_last_transcript_error"] = transcription_error
+        else:
+            ctx.pop("_audio_transcript_status", None)
+        s_label, s_score, s_raw = analyze_sentiment(text)
+        content_intent = detect_intent(text, {})
+        intent = content_intent if content_intent != "unknown" else detect_intent(text, ctx)
+        if message_type in AUDIO_MESSAGE_TYPES and ctx.get("_audio_transcript_status") == "failed":
+            intent = "voice_unavailable"
+
+        resolved_intent = resolve_context_intent(
+            detected_intent=intent,
+            message_type=message_type,
+            ctx=ctx,
+            message_text=text,
+        )
+        if _is_account_statement_request(text):
+            log.info(
+                "Detected explicit account statement request from %s (intent=%s, text=%s)",
+                wa_id,
+                resolved_intent,
+                text[:120].replace("\n", " "),
+            )
+            ctx["_account_statement_requested"] = True
+            if resolved_intent != ACCOUNT_STATEMENT_INTENT:
+                resolved_intent = ACCOUNT_STATEMENT_INTENT
+
+        raw_payload = {
+            "whatsapp": entry,
+            "transcript": transcript,
+            "transcription_error": transcription_error,
+        }
+
+        last_nudge_outbound_id = ctx.get("_last_nudge_outbound_id")
+        if (
+            last_nudge_outbound_id
+            and not ctx.get("_last_nudge_response_logged")
+            and resolved_intent not in {ZERO_TRIP_NUDGE_INTENT, None}
+        ):
+            try:
+                last_ts_raw = ctx.get("_last_nudge_at")
+                last_ts_float = float(last_ts_raw) if last_ts_raw else None
+                response_dt = jhb_now()
+                latency_sec: Optional[float] = None
+                if last_ts_float is not None:
+                    latency_sec = max(0.0, response_dt.timestamp() - last_ts_float)
+                updated = _record_nudge_response(
+                    whatsapp_message_id=last_nudge_outbound_id,
+                    response_message_id=msg_id,
+                    response_ts=response_dt,
+                    response_latency_sec=latency_sec,
+                    response_intent=resolved_intent,
+                )
+                if updated:
+                    ctx["_last_nudge_response_logged"] = True
+                    ctx["_last_nudge_response_msg_id"] = msg_id
+            except Exception as exc:
+                log.warning("Failed to record nudge response for %s: %s", wa_id, exc)
+
+        media_payload: Optional[Dict[str, Any]] = None
+        if media_url:
+            media_payload = {
+                "type": message_type,
+                "url": media_url,
+                "id": media_id,
+                "caption": caption_text,
+                "mime_type": media_obj.get("mime_type"),
+                "filename": media_obj.get("filename"),
+            }
+
+        # INBOUND LOG
+        log_message(
+            direction="INBOUND",
+            wa_id=wa_id,
+            text=text,
+            media_url=media_url,
+            intent=resolved_intent,
+            status="received",
+            wa_message_id=msg_id,
+            driver_id=None,
+            message_id=msg_id,
+            business_number=business_number,
+            phone_number_id=phone_number_id,
+            origin_type=origin_type,
+            raw_json=raw_payload,
+            timestamp_unix=timestamp_unix,
+            sentiment=s_label,
+            sentiment_score=s_score,
+            intent_label=resolved_intent,
+            ai_raw=s_raw,
+            conversation_id=msg_id,
+        )
+
+        last_reply = ctx.get("_last_reply")
+        last_reply_at = ctx.get("_last_reply_at")
+        last_inbound = ctx.get("_last_user_message")
+        blocked_ticket = _blocking_ticket_for_agentic_ai(wa_id, ctx)
+        if blocked_ticket:
+            ctx["_ticket_blocked_reason"] = blocked_ticket.get("status")
+            ctx["_ticket_blocked_at"] = time.time()
+            save_context_file(wa_id, ctx)
+            save_context_db(wa_id, resolved_intent, "", ctx)
+            log.debug("AI reply suppressed for %s because ticket %s is %s", wa_id, blocked_ticket.get("id"), blocked_ticket.get("status"))
+            return
+        reply = build_reply(
+            resolved_intent,
+            text,
+            driver,
+            ctx,
+            wa_id,
+            message_type=message_type,
+            media=media_payload,
+            location=location_payload,
+        )
+        _maybe_capture_telematics_location_for_open_ticket(
+            wa_id=wa_id,
+            driver=driver,
+            ctx=ctx,
+            location_payload=location_payload,
+        )
+        override_intent = ctx.pop("_intent_override", None)
+        if override_intent:
+            resolved_intent = override_intent
+        ctx["_last_intent"] = resolved_intent
+
+        if not reply:
+            save_context_file(wa_id, ctx)
+            save_context_db(wa_id, resolved_intent, last_reply or "", ctx)
+            return
+
+        if last_reply and reply == last_reply and last_reply_at:
+            try:
+                inbound_match = False
+                if last_inbound:
+                    inbound_match = re.sub(r"\s+", " ", text.strip().lower()) == re.sub(
+                        r"\s+", " ", str(last_inbound).strip().lower()
+                    )
+                if inbound_match and (time.time() - float(last_reply_at)) < REPEAT_REPLY_WINDOW_SECONDS:
+                    save_context_file(wa_id, ctx)
+                    save_context_db(wa_id, resolved_intent, last_reply or "", ctx)
+                    return
+            except Exception:
+                pass
+
+        display_name = (driver.get("display_name") or driver.get("first_name") or "Driver").strip()
+        reply = with_greet(ctx, display_name, reply, resolved_intent)
+
+        ctx["_last_reply"] = reply
+        ctx["_last_reply_at"] = time.time()
+
+        # Save context
+        save_context_file(wa_id, ctx)
+        save_context_db(wa_id, resolved_intent, reply, ctx)
+
+        # Send reply
+        outbound_id = send_whatsapp_text(wa_id, reply)
+
+        # OUTBOUND LOG
+        s2_label, s2_score, s2_raw = analyze_sentiment(reply or "")
+        try:
+            inbound_ts = int(timestamp_unix) if timestamp_unix and str(timestamp_unix).isdigit() else int(time.time())
+            response_time = max(0.0, time.time() - inbound_ts)
+        except Exception:
+            response_time = None
+
+        log_message(
+            direction="OUTBOUND",
+            wa_id=wa_id,
+            text=reply,
+            intent=resolved_intent,
+            status="sent" if outbound_id else "send_failed",
+            wa_message_id=outbound_id,
+            driver_id=None,
+            message_id=outbound_id,
+            business_number=business_number,
+            phone_number_id=phone_number_id,
+            origin_type=origin_type,
+            raw_json={"reply": reply, "conversation_id": msg_id},
+            timestamp_unix=str(int(time.time())),
+            sentiment=s2_label,
+            sentiment_score=s2_score,
+            intent_label=resolved_intent,
+            ai_raw=s2_raw,
+            conversation_id=msg_id,
+            response_time_sec=response_time,
+        )
+    except Exception as exc:
+        log.exception("Failed to process webhook entry: %s", exc)
+
 @app.post("/webhook")
-async def webhook(request: Request):
+async def webhook(request: Request, background_tasks: BackgroundTasks):
     data = await request.json()
     log.info("📩 Payload: %s", json.dumps(data, ensure_ascii=False))
 
@@ -20046,268 +28871,23 @@ async def webhook(request: Request):
     except Exception:
         return {"ok": True}
 
-    meta = entry.get("metadata", {})
-    business_number = meta.get("display_phone_number")
-    phone_number_id = meta.get("phone_number_id")
-    origin_type = entry.get("messaging_product", "whatsapp")
+    messages = entry.get("messages") or []
+    msg_id: Optional[str] = None
+    if messages:
+        msg_id = (messages[0] or {}).get("id")
 
-    # status events
-    for st in entry.get("statuses", []) or []:
-        log_status_event(
-            status_event=st,
-            business_number=business_number,
-            phone_number_id=phone_number_id,
-            origin_type=origin_type,
-        )
-    if "messages" not in entry:
-        return {"ok": True}
-
-    m = entry["messages"][0]
-    msg_id = m.get("id")
-    timestamp_unix = m.get("timestamp")
-
-    # simple dedupe (in-memory)
     _dups = getattr(webhook, "_dups", {})
     nowts = time.time()
-    for k,v in list(_dups.items()):
-        if nowts - v > 120: _dups.pop(k, None)
-    if msg_id in _dups:
+    for k, v in list(_dups.items()):
+        if nowts - v > 120:
+            _dups.pop(k, None)
+    if msg_id and msg_id in _dups:
         return {"ok": True}
-    _dups[msg_id] = nowts
+    if msg_id:
+        _dups[msg_id] = nowts
     setattr(webhook, "_dups", _dups)
 
-    wa_id  = m.get("from")
-    message_type = m.get("type") or "text"
-    text: str = ""
-    media_url: Optional[str] = None
-    media_id: Optional[str] = None
-    caption_text: str = ""
-    location_payload: Optional[Dict[str, Any]] = None
-
-    transcript: Optional[str] = None
-    transcription_error: Optional[str] = None
-
-    if message_type == "text":
-        text = (m.get("text") or {}).get("body", "").strip()
-    else:
-        media_obj = m.get(message_type) or {}
-        caption_text = (media_obj.get("caption") or media_obj.get("filename") or "").strip()
-        text = caption_text or ""
-        media_id = media_obj.get("id")
-        media_url = media_obj.get("link") or fetch_media_url(media_id)
-        if message_type == "location":
-            location_payload = {
-                "latitude": media_obj.get("latitude"),
-                "longitude": media_obj.get("longitude"),
-                "name": media_obj.get("name"),
-                "address": media_obj.get("address"),
-            }
-            if not text:
-                text = media_obj.get("name") or media_obj.get("address") or "[location]"
-        if message_type in AUDIO_MESSAGE_TYPES:
-            media_bytes = download_media_bytes(media_url)
-            if media_bytes:
-                transcript, transcribe_err = transcribe_audio_bytes(media_bytes, mime_type=media_obj.get("mime_type"))
-                if transcript:
-                    text = transcript.strip()
-                else:
-                    transcription_error = transcribe_err or "transcription_failed"
-            else:
-                transcription_error = "download_failed"
-            if not text:
-                placeholder = "voice note" if message_type == "voice" else "audio message"
-                text = f"[{placeholder}]"
-        else:
-            if not text:
-                text = f"[{message_type} message]"
-
-    driver = lookup_driver_by_wa(wa_id)
-    ctx_f  = load_context_file(wa_id)
-    ctx    = dict(ctx_f)
-    _clear_closed_ticket_context(ctx)
-
-    if media_url:
-        ctx["_last_media"] = {
-            "id": media_id,
-            "type": message_type,
-            "url": media_url,
-            "caption": caption_text,
-            "timestamp": timestamp_unix,
-        }
-
-    if message_type in AUDIO_MESSAGE_TYPES:
-        if transcript:
-            ctx["_audio_transcript_status"] = "ok"
-            ctx["_last_audio_transcript"] = {
-                "text": transcript,
-                "captured_at": time.time(),
-                "media_id": media_id,
-            }
-            ctx.pop("_last_transcript_error", None)
-        else:
-            ctx["_audio_transcript_status"] = "failed"
-            if transcription_error:
-                ctx["_last_transcript_error"] = transcription_error
-    else:
-        ctx.pop("_audio_transcript_status", None)
-    s_label, s_score, s_raw = analyze_sentiment(text)
-    intent = detect_intent(text, ctx)
-    if message_type in AUDIO_MESSAGE_TYPES and ctx.get("_audio_transcript_status") == "failed":
-        intent = "voice_unavailable"
-
-    resolved_intent = resolve_context_intent(
-        detected_intent=intent,
-        message_type=message_type,
-        ctx=ctx,
-        message_text=text,
-    )
-
-    raw_payload = {
-        "whatsapp": entry,
-        "transcript": transcript,
-        "transcription_error": transcription_error,
-    }
-
-    last_nudge_outbound_id = ctx.get("_last_nudge_outbound_id")
-    if (
-        last_nudge_outbound_id
-        and not ctx.get("_last_nudge_response_logged")
-        and resolved_intent not in {ZERO_TRIP_NUDGE_INTENT, None}
-    ):
-        try:
-            last_ts_raw = ctx.get("_last_nudge_at")
-            last_ts_float = float(last_ts_raw) if last_ts_raw else None
-            response_dt = jhb_now()
-            latency_sec: Optional[float] = None
-            if last_ts_float is not None:
-                latency_sec = max(0.0, response_dt.timestamp() - last_ts_float)
-            updated = _record_nudge_response(
-                whatsapp_message_id=last_nudge_outbound_id,
-                response_message_id=msg_id,
-                response_ts=response_dt,
-                response_latency_sec=latency_sec,
-                response_intent=resolved_intent,
-            )
-            if updated:
-                ctx["_last_nudge_response_logged"] = True
-                ctx["_last_nudge_response_msg_id"] = msg_id
-        except Exception as exc:
-            log.warning("Failed to record nudge response for %s: %s", wa_id, exc)
-
-    media_payload: Optional[Dict[str, Any]] = None
-    if media_url:
-        media_payload = {
-            "type": message_type,
-            "url": media_url,
-            "id": media_id,
-            "caption": caption_text,
-            "mime_type": media_obj.get("mime_type"),
-            "filename": media_obj.get("filename"),
-        }
-
-    # INBOUND LOG
-    log_message(
-        direction="INBOUND",
-        wa_id=wa_id,
-        text=text,
-        media_url=media_url,
-        intent=resolved_intent,
-        status="received",
-        wa_message_id=msg_id,
-        driver_id=None,
-        message_id=msg_id,
-        business_number=business_number,
-        phone_number_id=phone_number_id,
-        origin_type=origin_type,
-        raw_json=raw_payload,
-        timestamp_unix=timestamp_unix,
-        sentiment=s_label,
-        sentiment_score=s_score,
-        intent_label=resolved_intent,
-        ai_raw=s_raw,
-        conversation_id=msg_id,
-    )
-
-    last_reply = ctx.get("_last_reply")
-    last_reply_at = ctx.get("_last_reply_at")
-    last_inbound = ctx.get("_last_user_message")
-    reply = build_reply(
-        resolved_intent,
-        text,
-        driver,
-        ctx,
-        wa_id,
-        message_type=message_type,
-        media=media_payload,
-        location=location_payload,
-    )
-    override_intent = ctx.pop("_intent_override", None)
-    if override_intent:
-        resolved_intent = override_intent
-    ctx["_last_intent"] = resolved_intent
-
-    if not reply:
-        save_context_file(wa_id, ctx)
-        save_context_db(wa_id, resolved_intent, last_reply or "", ctx)
-        return {"ok": True}
-
-    if last_reply and reply == last_reply and last_reply_at:
-        try:
-            inbound_match = False
-            if last_inbound:
-                inbound_match = re.sub(r"\s+", " ", text.strip().lower()) == re.sub(
-                    r"\s+", " ", str(last_inbound).strip().lower()
-                )
-            if inbound_match and (time.time() - float(last_reply_at)) < 900:
-                save_context_file(wa_id, ctx)
-                save_context_db(wa_id, resolved_intent, last_reply or "", ctx)
-                return {"ok": True}
-        except Exception:
-            pass
-
-    display_name = (driver.get("display_name") or driver.get("first_name") or "Driver").strip()
-    reply = with_greet(ctx, display_name, reply, resolved_intent)
-
-    ctx["_last_reply"] = reply
-    ctx["_last_reply_at"] = time.time()
-
-    # Save context
-    save_context_file(wa_id, ctx)
-    save_context_db(wa_id, resolved_intent, reply, ctx)
-
-    # Send reply
-    outbound_id = send_whatsapp_text(wa_id, reply)
-
-    # OUTBOUND LOG
-    s2_label, s2_score, s2_raw = analyze_sentiment(reply or "")
-    try:
-        inbound_ts = int(timestamp_unix) if timestamp_unix and str(timestamp_unix).isdigit() else int(time.time())
-        response_time = max(0.0, time.time() - inbound_ts)
-    except Exception:
-        response_time = None
-
-    log_message(
-        direction="OUTBOUND",
-        wa_id=wa_id,
-        text=reply,
-        intent=resolved_intent,
-        status="sent" if outbound_id else "send_failed",
-        wa_message_id=outbound_id,
-        driver_id=None,
-        message_id=outbound_id,
-        business_number=business_number,
-        phone_number_id=phone_number_id,
-        origin_type=origin_type,
-        raw_json={"reply": reply, "conversation_id": msg_id},
-        timestamp_unix=str(int(time.time())),
-        sentiment=s2_label,
-        sentiment_score=s2_score,
-        intent_label=resolved_intent,
-        ai_raw=s2_raw,
-        conversation_id=msg_id,
-        response_time_sec=response_time,
-    )
-
+    background_tasks.add_task(_process_webhook_entry, entry)
     return {"ok": True}
 
 # -----------------------------------------------------------------------------
